@@ -1,0 +1,93 @@
+# Cấu hình Alert System cho SV-PRO
+# Sao chép file này thành config/alerts.yml và điền thông tin thực tế.
+# Biến môi trường có thể override bằng cách đặt trong .env
+
+telegram:
+  # Token bot Telegram (lấy từ @BotFather)
+  bot_token: "${TELEGRAM_BOT_TOKEN}"
+  # Chat ID hoặc Group ID nhận cảnh báo
+  chat_id: "${TELEGRAM_CHAT_ID}"
+  # Bật/tắt gửi ảnh kèm theo cảnh báo
+  send_photo: true
+  # Timeout gọi API Telegram (giây)
+  timeout_secs: 5
+
+webhooks:
+  # Danh sách URL nhận POST webhook (JSON payload)
+  # Để trống nếu không dùng webhook ngoài Telegram
+  urls: []
+  # Ví dụ: ["https://n8n.example.com/webhook/svpro-alert"]
+  timeout_secs: 3
+  # Thêm header xác thực nếu cần (VD: Authorization Bearer ...)
+  headers:
+    Content-Type: "application/json"
+
+rate_limits:
+  # Mỗi (entity_id, event_type) chỉ nhận tối đa 1 alert trong khoảng thời gian này
+  per_entity_secs: 300      # 5 phút
+  # Giới hạn tổng số alert / phút (tránh spam khi nhiều camera kích hoạt cùng lúc)
+  global_per_minute: 20
+
+alert_rules:
+  # Kích hoạt khi phát hiện đối tượng trong blacklist
+  blacklist_detected:
+    enabled: true
+    severity: "HIGH"
+    # Gửi ngay - không delay
+    delay_secs: 0
+    message_template: |
+      🚨 *CẢNH BÁO: Đối tượng bị chú ý!*
+      📷 Camera: `{camera_id}`
+      🕐 Thời gian: `{timestamp}`
+      👤 Loại: `{entity_type}` — ID: `{entity_id}`
+      📝 Lý do: `{reason}`
+
+  # Kích hoạt khi người lạ xuất hiện trong vùng hạn chế
+  stranger_restricted_zone:
+    enabled: true
+    severity: "MEDIUM"
+    delay_secs: 3   # Chờ 3 giây xác nhận (tránh false positive)
+    zones:          # Danh sách zone áp dụng rule này
+      - "server_room"
+      - "warehouse"
+      - "restricted_area"
+    message_template: |
+      ⚠️ *Người lạ trong khu vực hạn chế*
+      📷 Camera: `{camera_id}` — Zone: `{zone}`
+      🕐 Thời gian: `{timestamp}`
+      🆔 Stranger ID: `{entity_id}`
+
+  # Kích hoạt khi phát hiện giả mạo khuôn mặt (spoof attempt)
+  spoof_detected:
+    enabled: true
+    severity: "HIGH"
+    delay_secs: 0
+    message_template: |
+      🔴 *Phát hiện giả mạo khuôn mặt!*
+      📷 Camera: `{camera_id}`
+      🕐 Thời gian: `{timestamp}`
+      📊 Liveness score: `{score:.2f}`
+
+  # Kích hoạt khi xe trong blacklist đi vào khu vực
+  vehicle_blacklisted:
+    enabled: true
+    severity: "HIGH"
+    delay_secs: 0
+    message_template: |
+      🚗 *Phát hiện xe bị chú ý!*
+      📷 Camera: `{camera_id}`
+      🕐 Thời gian: `{timestamp}`
+      🚘 Biển số: `{plate_number}` ({plate_category})
+
+access_control:
+  # URL relay controller để mở cửa (HTTP POST)
+  # VD: http://relay-controller:8080/api/door/{door_id}/trigger
+  relay_base_url: "${ACCESS_CONTROL_RELAY_URL:-}"
+  # Timeout gọi relay (giây)
+  timeout_secs: 2
+  # Mapping camera → door_id (nếu camera đó guard cửa nào)
+  camera_door_map: {}
+  # Ví dụ:
+  # camera_door_map:
+  #   cam_entrance_01: "door_main"
+  #   cam_entrance_02: "door_side"

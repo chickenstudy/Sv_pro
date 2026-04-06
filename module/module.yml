@@ -1,0 +1,84 @@
+name: sv-pro-high-performance-pipeline
+
+parameters:
+  frame:
+    width: 2592
+    height: 1944
+  output_frame:
+    codec: h264
+    encoder: nvenc
+  draw_func:
+    module: src.debug_drawfunc
+    class_name: DebugDrawFunc
+  buffer_queues:
+    length: 20
+    byte_size: 0
+
+pipeline:
+  elements:
+    # ── Stage 1: Primary Detector (YOLOv8s) ──────────────────────────────
+    # Phát hiện đồng thời Phương tiện và Con người trên GPU
+    - element: nvinfer@complex_model
+      name: yolov8_primary
+      model:
+        format: onnx
+        model_file: yolov8/yolov8s.onnx
+        batch_size: 1
+        input:
+          layer_name: images
+          shape: [3, 640, 640]
+          scale_factor: 0.0039215697906911373
+        output:
+          layer_names:
+            - output0
+          converter:
+            module: src.converters.yolov8_converter
+            class_name: YOLOv8Converter
+            kwargs:
+              confidence_threshold: 0.25
+              nms_iou_threshold: 0.45
+          num_detected_classes: 80
+          objects:
+            - class_id: 0
+              label: person
+            - class_id: 2
+              label: car
+            - class_id: 3
+              label: motorcycle
+            - class_id: 5
+              label: bus
+            - class_id: 7
+              label: truck
+
+    # ── Stage 2a: License Plate Recognition (LPR) ────────────────────────
+    # Chỉ kích hoạt cho các object thuộc nhóm Vehicle
+    - element: pyfunc
+      name: plate_ocr
+      module: src.lpr.plate_ocr
+      class_name: PlateOCR
+      kwargs:
+        plate_model_path: /models/yolov8n_plate/yolov8n_plate.onnx
+        plate_conf_threshold: 0.50
+        ocr_conf_threshold: 0.60
+        # ROI zones cho từng camera (được tối ưu bởi ROI Eval)
+        roi_zones:
+          cam_01: [0, 0, 2592, 1944] # Tọa độ mặc định, sẽ được cập nhật sau
+
+    # ── Stage 2b: Face Recognition (FR) ──────────────────────────────────
+    # Chỉ kích hoạt cho các object thuộc nhóm Person
+    - element: pyfunc
+      name: face_recognizer
+      module: src.fr.face_recognizer
+      class_name: FaceRecognizer
+      kwargs:
+        # Tên model InsightFace (sẽ được tự động tải hoặc copy vào /models)
+        model_name: buffalo_l 
+        det_size: [640, 640]
+        recognition_threshold: 0.60
+        # Database cấu hình
+        db_type: postgres 
+        db_config:
+          host: postgres-db
+          port: 5432
+          user: svpro_user
+          database: svpro_db

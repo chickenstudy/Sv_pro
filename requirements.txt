@@ -1,0 +1,35 @@
+# ── SV-PRO Backend Dependencies ─────────────────────────────────────────────────
+# FastAPI & ASGI server
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+
+# Database
+asyncpg>=0.29.0      # PostgreSQL async driver
+psycopg2-binary>=2.9 # Sync driver (dùng bởi business logic layer)
+
+# Auth
+pyjwt>=2.8.0
+
+# Config & validation
+pydantic>=2.6.0
+pydantic-settings>=2.2.0
+python-dotenv>=1.0.0
+
+# Redis
+redis>=5.0.0
+
+# AI / ML (cho AI Core)
+onnxruntime-gpu>=1.17.0   # Thay bằng onnxruntime nếu không có GPU
+paddlepaddle-gpu>=2.6.0   # hoặc paddlepaddle cho CPU
+paddleocr>=2.7.0
+opencv-python-headless>=4.9.0
+numpy>=1.24.0
+
+# Monitoring
+prometheus-fastapi-instrumentator>=6.1.0
+
+# HTTP client (dùng trong alert_manager fallback nếu cần)
+httpx>=0.27.0
+
+# YAML parsing (đọc config/alerts.yml)
+pyyaml>=6.0

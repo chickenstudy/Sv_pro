@@ -1,0 +1,225 @@
+version: '3.8'
+
+services:
+  # ── Ingress: Giả lập 1 stream camera (videotestsrc) ──
+  video-ingress:
+    image: ghcr.io/insight-platform/savant-adapters-gstreamer:latest
+    restart: unless-stopped
+    # Phát video dummy SMPTE pattern, gán tên cam_dummy_01
+    command: python -m savant_rs_video_source --pattern smpte --fps 15 -s cam_dummy_01 -e pub+connect:ipc:///tmp/zmq-sockets/input-video.ipc
+    volumes:
+      - zmq-sockets:/tmp/zmq-sockets
+    environment:
+      # ZMQ HWM configuration (Task 1.6)
+      - ZMQ_SNDHWM=100
+      - ZMQ_RCVHWM=100
+      - SYNC_OUTPUT=True
+    # Health-check Watchdog (Task 1.8)
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── AI Core: GPU Pipeline xử lý LPR + FR ──
+  savant-ai-core:
+    image: ghcr.io/insight-platform/savant-deepstream:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080" # Metrics / Health
+    volumes:
+      - .:/opt/savant/user_data
+      - zmq-sockets:/tmp/zmq-sockets
+      - models:/models
+    environment:
+      - MODEL_PATH=/models
+      # ZMQ Input & Output
+      - ZMQ_SRC_ENDPOINT=sub+bind:ipc:///tmp/zmq-sockets/input-video.ipc
+      - ZMQ_SINK_ENDPOINT=pub+bind:ipc:///tmp/zmq-sockets/output-video.ipc
+      # ZMQ HWM (Task 1.6)
+      - ZMQ_SNDHWM=100
+      - ZMQ_RCVHWM=100
+    command: module/module.yml
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Egress: Xuất JSON logs ──
+  json-egress:
+    image: ghcr.io/insight-platform/savant-adapters-py:latest
+    restart: unless-stopped
+    command: python -m savant_rs_message_logger -q sub+connect:ipc:///tmp/zmq-sockets/output-video.ipc
+    volumes:
+      - zmq-sockets:/tmp/zmq-sockets
+    environment:
+      - ZMQ_SNDHWM=100
+      - ZMQ_RCVHWM=100
+
+  # ── PostgreSQL + pgvector ──
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: svpro_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-svpro_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-svpro_pass}
+      POSTGRES_DB:       ${POSTGRES_DB:-svpro_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-svpro_user}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── DB Migration (chạy 1 lần khi startup) ──
+  db-init:
+    image: pgvector/pgvector:pg16
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-svpro_pass}
+    volumes:
+      - ./scripts/sql:/sql
+    command: >
+      bash -c "
+        psql -h postgres -U ${POSTGRES_USER:-svpro_user} -d ${POSTGRES_DB:-svpro_db} -f /sql/schema.sql &&
+        psql -h postgres -U ${POSTGRES_USER:-svpro_user} -d ${POSTGRES_DB:-svpro_db} -f /sql/migrations/001_sprint4_5.sql &&
+        echo '✅ DB migrations applied.'
+      "
+    restart: "no"
+
+  # ── FastAPI Backend ──
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: svpro_backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-svpro_user}:${POSTGRES_PASSWORD:-svpro_pass}@postgres:5432/${POSTGRES_DB:-svpro_db}
+      REDIS_HOST:   redis
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis (Hot Cache) ──
+  redis:
+    image: redis:7-alpine
+    container_name: svpro_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Prometheus — Metrics Collection ──
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: svpro_prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Grafana — Visualization ──
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: svpro_grafana
+    restart: unless-stopped
+    ports:
+      - "3001:3000"   # 3001 để tránh conflict với React dev server
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboard.json:/var/lib/grafana/dashboards/svpro.json:ro
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    environment:
+      GF_SECURITY_ADMIN_USER:     ${GF_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_ADMIN_PASS:-svpro2024}
+      GF_USERS_ALLOW_SIGN_UP:     "false"
+      GF_SERVER_ROOT_URL:         "http://localhost:3001"
+      GF_FEATURE_TOGGLES_ENABLE:  "publicDashboards"
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Redis Exporter ──
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.59.0
+    container_name: svpro_redis_exporter
+    restart: unless-stopped
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    ports:
+      - "9121:9121"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ── PostgreSQL Exporter ──
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: svpro_postgres_exporter
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_NAME: postgresql://${POSTGRES_USER:-svpro_user}:${POSTGRES_PASSWORD:-svpro_pass}@postgres:5432/${POSTGRES_DB:-svpro_db}?sslmode=disable
+    ports:
+      - "9187:9187"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  zmq-sockets:
+  models:
+  pgdata:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+

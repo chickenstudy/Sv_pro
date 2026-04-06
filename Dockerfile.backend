@@ -1,0 +1,41 @@
+FROM python:3.11-slim
+
+LABEL maintainer="SV-PRO Team"
+LABEL description="FastAPI Backend for SV-PRO Vehicle & Face Recognition System"
+
+WORKDIR /app
+
+# ── Cài đặt thư viện hệ thống cần thiết ───────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq-dev gcc curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Cài Python dependencies ────────────────────────────────────────────────────
+COPY requirements.txt .
+RUN pip install --no-cache-dir \
+    fastapi \
+    uvicorn[standard] \
+    asyncpg \
+    psycopg2-binary \
+    pyjwt \
+    pydantic \
+    pydantic-settings \
+    python-dotenv \
+    redis \
+    httpx \
+    pyyaml \
+    prometheus-fastapi-instrumentator
+
+# ── Copy source ────────────────────────────────────────────────────────────────
+COPY backend/ ./backend/
+COPY src/business/ ./src/business/
+COPY config/ ./config/
+
+# ── Port và lệnh khởi động ─────────────────────────────────────────────────────
+EXPOSE 8000
+
+# Health check nội bộ container
+HEALTHCHECK --interval=20s --timeout=5s --retries=5 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
