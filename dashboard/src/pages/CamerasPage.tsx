@@ -1,29 +1,15 @@
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
+import useSWR from 'swr'
 import { camerasApi, type Camera } from '../api'
+import { Camera as CameraIcon, Plus, X, Save, Clock, HelpCircle } from 'lucide-react'
 
-/**
- * Trang quản lý Camera — hiển thị danh sách camera với trạng thái và cho phép
- * thêm, cập nhật ai_mode, bật/tắt camera.
- */
 export default function CamerasPage() {
-  const [cameras, setCameras] = useState<Camera[]>([])
-  const [loading, setLoading] = useState(true)
+  const { data: cameras = [], error, isLoading, mutate } = useSWR('/api/cameras', camerasApi.list)
+
   const [showForm, setShowForm] = useState(false)
   const [form, setForm] = useState({ name: '', rtsp_url: '', location: '', zone: '', ai_mode: 'both' })
   const [saving, setSaving] = useState(false)
-  const [error, setError] = useState('')
-
-  const load = async () => {
-    try {
-      setCameras(await camerasApi.list())
-    } catch (e: any) {
-      setError(e.message)
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  useEffect(() => { load() }, [])
+  const [formError, setFormError] = useState('')
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -32,9 +18,9 @@ export default function CamerasPage() {
       await camerasApi.create(form)
       setShowForm(false)
       setForm({ name: '', rtsp_url: '', location: '', zone: '', ai_mode: 'both' })
-      load()
-    } catch (e: any) {
-      setError(e.message)
+      mutate()
+    } catch (err: any) {
+      setFormError(err.message)
     } finally {
       setSaving(false)
     }
@@ -42,7 +28,7 @@ export default function CamerasPage() {
 
   const toggleEnabled = async (cam: Camera) => {
     await camerasApi.update(cam.id, { enabled: !cam.enabled })
-    load()
+    mutate()
   }
 
   const AI_MODE_BADGE: Record<string, string> = {
@@ -54,20 +40,22 @@ export default function CamerasPage() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h2 style={{ fontSize: 18, fontWeight: 700 }}>📷 Quản lý Camera</h2>
+          <h2 style={{ fontSize: 18, fontWeight: 700, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <CameraIcon size={22} color="var(--brand)" /> Quản lý Camera
+          </h2>
           <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
             Thêm và cấu hình các luồng camera RTSP
           </p>
         </div>
         <button className="btn btn--primary" onClick={() => setShowForm(v => !v)}>
-          {showForm ? '✕ Đóng' : '➕ Thêm Camera'}
+          {showForm ? <><X size={16} /> Đóng</> : <><Plus size={16} /> Thêm Camera</>}
         </button>
       </div>
 
       {/* Add form */}
       {showForm && (
         <div className="card">
-          <div className="card__title">➕ Thêm Camera Mới</div>
+          <div className="card__title"><Plus size={16} /> Thêm Camera Mới</div>
           <form onSubmit={handleCreate} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
             <div className="form-group">
               <label>Tên camera *</label>
@@ -101,27 +89,30 @@ export default function CamerasPage() {
             </div>
             <div style={{ display: 'flex', alignItems: 'flex-end', gap: 8 }}>
               <button id="save-camera-btn" type="submit" className="btn btn--primary" disabled={saving}>
-                {saving ? '⏳ Đang lưu...' : '💾 Lưu Camera'}
+                {saving ? <Clock size={16} className="animate-spin" /> : <Save size={16} />}
+                {saving ? ' Đang lưu...' : ' Lưu Camera'}
               </button>
             </div>
           </form>
         </div>
       )}
 
-      {error && (
-        <div style={{ color: 'var(--danger)', fontSize: 12, padding: '8px 12px',
-          background: 'var(--danger)15', borderRadius: 'var(--r-md)', border: '1px solid var(--danger)30' }}>
-          ❌ {error}
+      {(error || formError) && (
+        <div style={{
+          color: 'var(--danger)', fontSize: 12, padding: '8px 12px',
+          background: 'var(--danger)15', borderRadius: 'var(--r-md)', border: '1px solid var(--danger)30'
+        }}>
+          ❌ {formError || (error as any)?.message || 'Có lỗi xảy ra'}
         </div>
       )}
 
       {/* Table */}
       <div className="card" style={{ padding: 0 }}>
         <div className="table-wrap">
-          {loading ? (
-            <div className="empty-state"><div className="empty-state__icon">⏳</div>Đang tải danh sách camera...</div>
+          {isLoading ? (
+            <div className="empty-state"><Clock size={36} className="empty-state__icon" /> Đang tải danh sách camera...</div>
           ) : cameras.length === 0 ? (
-            <div className="empty-state"><div className="empty-state__icon">📷</div>Chưa có camera nào. Nhấn "Thêm Camera" để bắt đầu.</div>
+            <div className="empty-state"><HelpCircle size={36} className="empty-state__icon" /> Chưa có camera nào. Nhấn "Thêm Camera" để bắt đầu.</div>
           ) : (
             <table>
               <thead>

@@ -78,13 +78,13 @@ def download_file(url: str, dest_path: str) -> bool:
     """
     os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
     print(f"  URL : {url}")
-    print(f"  Lưu : {dest_path}")
+    print(f"  Save: {dest_path}")
     try:
         urllib.request.urlretrieve(url, dest_path, reporthook=_progress_hook)
         print()   # Xuống dòng sau progress
         return True
     except Exception as exc:
-        print(f"\n  ❌ Lỗi tải: {exc}")
+        print(f"\n  Download error: {exc}")
         return False
 
 
@@ -102,54 +102,61 @@ def download_buffalo_l(output_dir: Path) -> None:
     dest_scrfd  = extract_dir / "det_10g.onnx"
     dest_arc    = extract_dir / "w600k_r50.onnx"
     if dest_scrfd.exists() and dest_arc.exists():
-        print("  ✅ buffalo_l models đã tồn tại — bỏ qua tải.")
+        print("  buffalo_l models already exist - skipping download.")
         return
 
     print(f"\n{'='*60}")
-    print(f"📦 Đang tải buffalo_l.zip (SCRFD + ArcFace R100) ...")
+    print("Downloading buffalo_l.zip (SCRFD + ArcFace R100) ...")
     print(f"{'='*60}")
     if not zip_path.exists():
         ok = download_file(_BUFFALO_ZIP_URL, str(zip_path))
         if not ok:
-            print("  ❌ Không thể tải buffalo_l.zip. Vui lòng tải thủ công.")
+            print("  Could not download buffalo_l.zip. Please download manually.")
             return
     else:
-        print(f"  ℹ️  buffalo_l.zip đã tồn tại ({zip_path.stat().st_size // 1024 // 1024} MB) — bỏ qua tải lại.")
+        print(f"  buffalo_l.zip already exists ({zip_path.stat().st_size // 1024 // 1024} MB) - skipping.")
 
-    print(f"  📂 Đang giải nén → {extract_dir} ...")
+    print(f"  Extracting -> {extract_dir} ...")
     try:
         with zipfile.ZipFile(str(zip_path), "r") as zf:
             zf.extractall(str(output_dir))
-        print("  ✅ Giải nén thành công!")
+        print("  Extract OK.")
 
-        # Đổi tên file theo chuẩn path của SV-PRO
-        if (extract_dir / "det_10g.onnx").exists():
-            # Copy sang tên chuẩn
-            import shutil
-            shutil.copy(
-                str(extract_dir / "det_10g.onnx"),
-                str(output_dir / "scrfd_10g_bnkps.onnx"),
-            )
-            shutil.copy(
-                str(extract_dir / "w600k_r50.onnx"),
-                str(output_dir / "glintr100.onnx"),
-            )
-            print("  ✅ Đã copy sang models/scrfd_10g_bnkps.onnx & models/glintr100.onnx")
+        # Copy to SV-PRO expected filenames (InsightFace ZIP layout may vary).
+        import shutil
+
+        scrfd_src = extract_dir / "det_10g.onnx"
+        if not scrfd_src.exists():
+            scrfd_src = output_dir / "det_10g.onnx"
+        arc_src = extract_dir / "w600k_r50.onnx"
+        if not arc_src.exists():
+            arc_src = output_dir / "w600k_r50.onnx"
+
+        if scrfd_src.exists():
+            shutil.copy(str(scrfd_src), str(output_dir / "scrfd_10g_bnkps.onnx"))
+        if arc_src.exists():
+            shutil.copy(str(arc_src), str(output_dir / "glintr100.onnx"))
+        if scrfd_src.exists() and arc_src.exists():
+            print("  Copied to models/scrfd_10g_bnkps.onnx and models/glintr100.onnx")
     except Exception as exc:
-        print(f"  ❌ Lỗi giải nén: {exc}")
+        print(f"  Extract error: {exc}")
 
 
 def download_minifasnet(output_dir: Path) -> None:
-    """Tải MiniFASNet ONNX model cho anti-spoofing từ GitHub minivision-ai."""
+    """Download MiniFASNet ONNX for anti-spoofing (ONNXRuntime in FaceRecognizer)."""
     dest = output_dir / "anti_spoof" / "minifasnet.onnx"
     if dest.exists():
-        print(f"  ✅ minifasnet.onnx đã tồn tại — bỏ qua.")
+        print("  minifasnet.onnx already exists - skipping.")
         return
 
     print(f"\n{'='*60}")
-    print("📦 Đang tải MiniFASNet (Anti-spoofing) ...")
+    print("Downloading MiniFASNet (Anti-spoofing) ONNX ...")
     print(f"{'='*60}")
-    url = "https://github.com/minivision-ai/Silent-Face-Anti-Spoofing/raw/master/resources/anti_spoof_models/2.7_80x80_MiniFASNetV2.onnx"
+    # minivision repo ships .pth only; use pre-exported ONNX from yakhyo/face-anti-spoofing releases.
+    url = (
+        "https://github.com/yakhyo/face-anti-spoofing/releases/download/weights/"
+        "MiniFASNetV2.onnx"
+    )
     download_file(url, str(dest))
 
 
@@ -159,10 +166,10 @@ def print_instructions(output_dir: Path) -> None:
     Các model này cần fine-tune hoặc tải từ bên thứ 3.
     """
     print(f"\n{'='*60}")
-    print("📋 HƯỚNG DẪN TẢI THÊM MODEL THỦ CÔNG")
+    print("MANUAL MODEL DOWNLOAD INSTRUCTIONS")
     print(f"{'='*60}")
     print(f"""
-⚠️  Các model sau cần tải thủ công (do giới hạn phân phối):
+NOTE: The following models must be downloaded manually:
 
 1. YOLOv8s (Vehicle Detection):
    - Nguồn: Ultralytics HuggingFace (fine-tuned VN vehicles)
@@ -174,7 +181,7 @@ def print_instructions(output_dir: Path) -> None:
 
 3. PaddleOCR:
    - Tự động tải khi lần đầu gọi PaddleOCR(lang='en')
-   - Không cần copy thủ công
+   - No manual copy needed
 
 Sau khi đặt đúng vị trí, chạy:
   docker compose up -d --build
@@ -202,23 +209,23 @@ def main() -> None:
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n🚀 SV-PRO Model Downloader")
+    print("\nSV-PRO Model Downloader")
     print(f"   Output: {output_dir}\n")
 
     if not args.skip_buffalo:
         download_buffalo_l(output_dir)
     else:
-        print("⏭️  Bỏ qua buffalo_l (SCRFD + ArcFace).")
+        print("Skip buffalo_l (SCRFD + ArcFace).")
 
     if not args.skip_antispoof:
         download_minifasnet(output_dir)
     else:
-        print("⏭️  Bỏ qua MiniFASNet.")
+        print("Skip MiniFASNet.")
 
     print_instructions(output_dir)
 
-    print(f"\n✅ Hoàn thành! Kiểm tra thư mục: {output_dir}")
-    print("   Nhớ tải thêm các model YOLOv8 theo hướng dẫn ở trên.\n")
+    print(f"\nDone. Check folder: {output_dir}")
+    print("   Remember to download YOLOv8 models as instructed above.\n")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,70 @@
+# ── Prometheus — SV-PRO Monitoring Config ────────────────────────────────────
+# Thu thập metrics từ: FastAPI backend, Savant AI Core, Redis, PostgreSQL
+# Scrape interval: 15 giây cho hot services, 30 giây cho cold services
+
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+  external_labels:
+    project: 'sv-pro'
+    env:     'production'
+
+# ── Alert rules (tùy chọn, dùng với Alertmanager) ────────────────────────────
+rule_files:
+  - "/etc/prometheus/rules/*.yml"
+
+# ── Scrape jobs ───────────────────────────────────────────────────────────────
+scrape_configs:
+
+  # FastAPI Backend — metrics endpoint /metrics
+  - job_name: 'svpro_backend'
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['backend:8000']
+        labels:
+          service: 'backend'
+          component: 'api'
+    metrics_path: '/metrics'
+
+  # Savant AI Core — DeepStream pipeline metrics
+  - job_name: 'svpro_ai_core'
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['savant-ai-core:8080']
+        labels:
+          service: 'ai_core'
+          component: 'pipeline'
+    metrics_path: '/metrics'
+
+  # Redis Exporter — cache metrics
+  - job_name: 'svpro_redis'
+    scrape_interval: 30s
+    static_configs:
+      - targets: ['redis-exporter:9121']
+        labels:
+          service: 'redis'
+          component: 'cache'
+
+  # PostgreSQL Exporter — DB metrics
+  - job_name: 'svpro_postgres'
+    scrape_interval: 30s
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+        labels:
+          service: 'postgres'
+          component: 'database'
+
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # NVIDIA GPU Exporter (dcgm-exporter) — nếu chạy trên Linux với GPU
+  - job_name: 'svpro_gpu'
+    scrape_interval: 10s
+    static_configs:
+      - targets: ['dcgm-exporter:9400']
+        labels:
+          service: 'gpu'
+          component: 'nvidia'
+    honor_labels: true

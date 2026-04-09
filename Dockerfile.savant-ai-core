@@ -1,0 +1,23 @@
+FROM ghcr.io/insight-platform/savant-deepstream:latest
+
+# SV-PRO pyfunc dependencies inside Savant venv (/opt/venv).
+# Constraints:
+# - Savant 0.6.x expects numpy<2 and click~=8.1.6
+# - Pip `opencv-*` wheels shadow the image cv2 and break Savant DeepStream (e.g. cv2.cuda.ALPHA_OVER).
+#   After PaddleOCR install, uninstall pip OpenCV so the system/DeepStream cv2 is used.
+# - `src/lpr/plate_ocr.py` patches missing cv2 inpaint constants before importing paddleocr; Debian
+#   minimal cv2 builds may omit attrs that albumentations expects at import time.
+
+RUN /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
+ && /opt/venv/bin/pip install --no-cache-dir \
+        "numpy>=1.22.4,<2" \
+        "redis>=5.0" \
+        prometheus-client \
+        psycopg2-binary \
+        onnxruntime-gpu==1.24.4
+
+RUN /opt/venv/bin/pip install --no-cache-dir paddlepaddle-gpu==2.6.2 \
+ && /opt/venv/bin/pip install --no-cache-dir "paddleocr>=2.7,<3"
+
+RUN /opt/venv/bin/pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python 2>/dev/null || true \
+ && /opt/venv/bin/pip install --no-cache-dir "numpy>=1.22.4,<2" "click>=8.1.6,<8.2"

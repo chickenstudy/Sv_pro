@@ -1,74 +1,113 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
+import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
+import {
+  LayoutDashboard,
+  Camera as CameraIcon,
+  Users,
+  UserX,
+  Car,
+  DoorOpen,
+  Activity,
+  BellRing,
+  LogOut,
+  ChevronLeft,
+  ChevronRight,
+  Target
+} from 'lucide-react'
 import { clearToken } from '../api'
 
-interface Props {
-  page: string
-  onNavigate: (page: string) => void
-}
+// ── Shared Config ─────────────────────────────────────────────────────────────
 
 const NAV_ITEMS = [
-  { id: 'dashboard', icon: '📊', label: 'Dashboard' },
-  { id: 'cameras',   icon: '📷', label: 'Camera' },
-  { id: 'users',     icon: '👥', label: 'Danh tính' },
-  { id: 'strangers', icon: '👤', label: 'Người lạ' },
-  { id: 'vehicles',  icon: '🚗', label: 'Phương tiện' },
-  { id: 'doors',     icon: '🚪', label: 'Điều khiển Cửa' },
-  { id: 'events',    icon: '🚨', label: 'Sự kiện Access' },
-  { id: 'alerts',    icon: '🔔', label: 'Cảnh báo' },
+  { path: '/', icon: LayoutDashboard, label: 'Dashboard' },
+  { path: '/cameras', icon: CameraIcon, label: 'Camera' },
+  { path: '/users', icon: Users, label: 'Danh tính' },
+  { path: '/strangers', icon: UserX, label: 'Người lạ' },
+  { path: '/vehicles', icon: Car, label: 'Phương tiện' },
+  { path: '/doors', icon: DoorOpen, label: 'Điều khiển Cửa' },
+  { path: '/events', icon: Activity, label: 'Sự kiện Access' },
+  { path: '/alerts', icon: BellRing, label: 'Cảnh báo' },
 ]
 
 const PAGE_TITLES: Record<string, string> = {
-  dashboard: 'Tổng quan hệ thống',
-  cameras:   'Quản lý Camera',
-  users:     'Quản lý Danh tính (Users)',
-  strangers: 'Theo dõi Người lạ (Strangers)',
-  vehicles:  'Quản lý Phương tiện (LPR)',
-  doors:     'Quản lý Cửa (Access Control)',
-  events:    'Sự kiện Access Control',
-  alerts:    'Lịch sử Cảnh báo',
+  '/': 'Tổng quan hệ thống',
+  '/cameras': 'Quản lý Camera',
+  '/users': 'Quản lý Danh tính (Users)',
+  '/strangers': 'Theo dõi Người lạ (Strangers)',
+  '/vehicles': 'Quản lý Phương tiện (LPR)',
+  '/doors': 'Quản lý Cửa (Access Control)',
+  '/events': 'Sự kiện Access Control',
+  '/alerts': 'Lịch sử Cảnh báo',
 }
 
-/**
- * Shell layout: Sidebar + Topbar bao bọc toàn bộ Dashboard.
- * Quản lý state navigation, realtime clock và logout.
- */
-export default function AppShell({ page, onNavigate }: Props) {
+// ── AppShell Component (Layout chính) ────────────────────────────────────────
+
+export default function AppShell() {
   const [collapsed, setCollapsed] = useState(false)
   const [time, setTime] = useState(() => new Date().toLocaleTimeString('vi-VN'))
+  const location = useLocation()
+  const navigate = useNavigate()
 
-  // Cập nhật đồng hồ mỗi giây
-  useState(() => {
+  useEffect(() => {
     const id = setInterval(() => setTime(new Date().toLocaleTimeString('vi-VN')), 1000)
     return () => clearInterval(id)
-  })
+  }, [])
 
   const handleLogout = () => {
     if (confirm('Đăng xuất khỏi SV-PRO?')) {
       clearToken()
-      window.location.reload()
+      navigate('/login')
     }
   }
 
-  return { collapsed, time, handleLogout }
+  const currentTitle = PAGE_TITLES[location.pathname] ?? 'SV-PRO'
+
+  return (
+    <div className={`layout ${collapsed ? 'layout--collapsed' : ''}`}>
+      <Sidebar
+        collapsed={collapsed}
+        onCollapse={() => setCollapsed(c => !c)}
+        onLogout={handleLogout}
+      />
+      <div className="main-content">
+        <header className="topbar">
+          <div className="topbar__title">{currentTitle}</div>
+          <div className="topbar__actions">
+            <div className="topbar__time" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <span className="dot-live" />
+              <span>{time}</span>
+            </div>
+            <span style={{
+              fontSize: 11, color: 'var(--text-muted)', padding: '4px 8px',
+              background: 'var(--bg-elevated)', borderRadius: 'var(--r-sm)', border: '1px solid var(--border)'
+            }}>
+              Live System
+            </span>
+          </div>
+        </header>
+
+        <main className="page-body">
+          <Outlet />
+        </main>
+      </div>
+    </div>
+  )
 }
 
-/**
- * Sidebar component: navigation + logo + collapse button + logout.
- */
-export function Sidebar({ page, onNavigate, collapsed, onCollapse, onLogout }: {
-  page: string
-  onNavigate: (p: string) => void
+// ── Sidebar Sub-Component ────────────────────────────────────────────────────
+
+function Sidebar({ collapsed, onCollapse, onLogout }: {
   collapsed: boolean
   onCollapse: () => void
   onLogout: () => void
 }) {
   return (
-    <aside className={`sidebar ${collapsed ? 'layout--sidebar-collapsed' : ''}`}
-      style={{ width: collapsed ? 64 : 240, transition: 'width .25s ease' }}>
-
+    <aside className="sidebar" style={{ width: collapsed ? 64 : 240 }}>
       {/* Logo */}
       <div className="sidebar__logo">
-        <div className="sidebar__logo-icon">🎯</div>
+        <div className="sidebar__logo-icon">
+          <Target size={20} color="#fff" />
+        </div>
         {!collapsed && (
           <div>
             <div className="sidebar__logo-text">SV-PRO</div>
@@ -77,11 +116,11 @@ export function Sidebar({ page, onNavigate, collapsed, onCollapse, onLogout }: {
         )}
         <button
           className="btn btn--icon btn--ghost"
-          style={{ marginLeft: 'auto', fontSize: 12 }}
+          style={{ marginLeft: 'auto', padding: 4 }}
           onClick={onCollapse}
           title={collapsed ? 'Mở rộng' : 'Thu nhỏ'}
         >
-          {collapsed ? '»' : '«'}
+          {collapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
         </button>
       </div>
 
@@ -89,17 +128,15 @@ export function Sidebar({ page, onNavigate, collapsed, onCollapse, onLogout }: {
       <nav className="sidebar__nav">
         {!collapsed && <div className="sidebar__section-label">Điều hướng</div>}
         {NAV_ITEMS.map(item => (
-          <button
-            key={item.id}
-            id={`nav-${item.id}`}
-            className={`nav-item ${page === item.id ? 'nav-item--active' : ''}`}
-            onClick={() => onNavigate(item.id)}
+          <NavLink
+            key={item.path}
+            to={item.path}
+            className={({ isActive }) => `nav-item ${isActive ? 'nav-item--active' : ''}`}
             title={collapsed ? item.label : undefined}
-            style={{ width: '100%', background: 'none', border: page === item.id ? '1px solid var(--brand)30' : '1px solid transparent', cursor: 'pointer' }}
           >
-            <span className="nav-item__icon">{item.icon}</span>
+            <item.icon size={18} className="nav-item__icon" />
             {!collapsed && <span>{item.label}</span>}
-          </button>
+          </NavLink>
         ))}
       </nav>
 
@@ -108,32 +145,13 @@ export function Sidebar({ page, onNavigate, collapsed, onCollapse, onLogout }: {
         <button
           className="nav-item"
           onClick={onLogout}
-          style={{ width: '100%', background: 'none', border: '1px solid transparent', cursor: 'pointer' }}
           title={collapsed ? 'Đăng xuất' : undefined}
+          style={{ width: '100%', background: 'none' }}
         >
-          <span className="nav-item__icon">🚪</span>
+          <LogOut size={18} className="nav-item__icon" />
           {!collapsed && <span>Đăng xuất</span>}
         </button>
       </div>
     </aside>
-  )
-}
-
-/**
- * Topbar component: tiêu đề trang + đồng hồ thực + nút refresh.
- */
-export function Topbar({ page, time }: { page: string; time: string }) {
-  return (
-    <header className="topbar">
-      <div className="topbar__title">{PAGE_TITLES[page] ?? page}</div>
-      <div className="topbar__actions">
-        <div className="topbar__time">🕐 {time}</div>
-        <span style={{ fontSize: 11, color: 'var(--text-muted)', padding: '4px 8px',
-          background: 'var(--bg-elevated)', borderRadius: 'var(--r-sm)', border: '1px solid var(--border)' }}>
-          <span className="dot-live" style={{ marginRight: 4 }} />
-          Live
-        </span>
-      </div>
-    </header>
   )
 }

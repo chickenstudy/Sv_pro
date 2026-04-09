@@ -1,52 +1,65 @@
-import { useState, useEffect } from 'react'
-import { eventsApi, type AccessEvent } from '../api'
+import { useState } from 'react'
+import useSWR from 'swr'
+import { eventsApi } from '../api'
+import {
+  ClipboardList,
+  ShieldCheck,
+  UserRoundX,
+  Car,
+  Lock,
+  Clock,
+  VenetianMask,
+  Link2,
+  Zap,
+  RefreshCw
+} from 'lucide-react'
 
-/**
- * Trang Lịch sử cảnh báo (Events) — danh sách đầy đủ access_events
- * với bộ lọc theo severity, camera_id, event_type và phân trang.
- */
 export default function EventsPage() {
-  const [events, setEvents]     = useState<AccessEvent[]>([])
-  const [loading, setLoading]   = useState(true)
   const [severity, setSeverity] = useState('')
   const [eventType, setEventType] = useState('')
-  const [page, setPage]         = useState(0)
+  const [page, setPage] = useState(0)
   const PAGE_SIZE = 30
 
-  const load = async () => {
-    setLoading(true)
-    try {
-      const data = await eventsApi.list({
-        severity:   severity || undefined,
-        event_type: eventType || undefined,
-        limit:      PAGE_SIZE,
-        offset:     page * PAGE_SIZE,
-      })
-      setEvents(data)
-    } catch { /* ignore */ }
-    finally { setLoading(false) }
+  const buildQuery = () => {
+    const q = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String(page * PAGE_SIZE) })
+    if (severity) q.set('severity', severity)
+    if (eventType) q.set('event_type', eventType)
+    return `/api/events?${q.toString()}`
   }
 
-  useEffect(() => { load() }, [severity, eventType, page])
+  const { data: events = [], isLoading, mutate } = useSWR(
+    buildQuery(),
+    () => eventsApi.list({
+      severity: severity || undefined,
+      event_type: eventType || undefined,
+      limit: PAGE_SIZE,
+      offset: page * PAGE_SIZE,
+    })
+  )
 
   const SEV_BADGE: Record<string, string> = {
     CRITICAL: 'critical', HIGH: 'high', MEDIUM: 'medium', LOW: 'low',
   }
 
-  const EVENT_ICONS: Record<string, string> = {
-    blacklist_person: '🚫',
-    blacklist_vehicle: '🚗',
-    zone_denied: '🔒',
-    time_denied: '🕐',
-    spoof_detected: '🎭',
-    object_linked: '🔗',
+  const getEventIcon = (type: string) => {
+    switch (type) {
+      case 'blacklist_person': return <UserRoundX size={14} className="inline mr-1" />
+      case 'blacklist_vehicle': return <Car size={14} className="inline mr-1" />
+      case 'zone_denied': return <Lock size={14} className="inline mr-1" />
+      case 'time_denied': return <Clock size={14} className="inline mr-1" />
+      case 'spoof_detected': return <VenetianMask size={14} className="inline mr-1" />
+      case 'object_linked': return <Link2 size={14} className="inline mr-1" />
+      default: return <Zap size={14} className="inline mr-1" />
+    }
   }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
       {/* Header */}
       <div>
-        <h2 style={{ fontSize: 18, fontWeight: 700 }}>📋 Lịch sử Cảnh báo</h2>
+        <h2 style={{ fontSize: 18, fontWeight: 700, display: 'flex', alignItems: 'center', gap: 8 }}>
+          <ClipboardList size={22} color="var(--brand)" /> Lịch sử Cảnh báo
+        </h2>
         <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
           Toàn bộ sự kiện cảnh báo từ pipeline AI
         </p>
@@ -60,10 +73,10 @@ export default function EventsPage() {
             <select className="input" style={{ width: 'auto' }}
               value={severity} onChange={e => { setSeverity(e.target.value); setPage(0) }}>
               <option value="">Tất cả</option>
-              <option value="CRITICAL">💀 Critical</option>
-              <option value="HIGH">🔴 High</option>
-              <option value="MEDIUM">🟠 Medium</option>
-              <option value="LOW">🟢 Low</option>
+              <option value="CRITICAL">Critical</option>
+              <option value="HIGH">High</option>
+              <option value="MEDIUM">Medium</option>
+              <option value="LOW">Low</option>
             </select>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -78,7 +91,9 @@ export default function EventsPage() {
               <option value="object_linked">Liên kết xe-người</option>
             </select>
           </div>
-          <button className="btn btn--ghost btn--sm" onClick={load}>🔄 Tải lại</button>
+          <button className="btn btn--ghost btn--sm" onClick={() => mutate()}>
+            <RefreshCw size={14} className={isLoading ? "animate-spin" : ""} /> Tải lại
+          </button>
           <span style={{ marginLeft: 'auto', fontSize: 12, color: 'var(--text-muted)' }}>
             Trang {page + 1}
           </span>
@@ -88,11 +103,11 @@ export default function EventsPage() {
       {/* Table */}
       <div className="card" style={{ padding: 0 }}>
         <div className="table-wrap">
-          {loading ? (
-            <div className="empty-state"><div className="empty-state__icon">⏳</div>Đang tải...</div>
+          {isLoading ? (
+            <div className="empty-state"><Clock size={36} className="empty-state__icon" /> Đang tải...</div>
           ) : events.length === 0 ? (
             <div className="empty-state">
-              <div className="empty-state__icon">🛡️</div>
+              <ShieldCheck size={36} className="empty-state__icon" />
               Không có sự kiện nào với bộ lọc hiện tại
             </div>
           ) : (
@@ -118,8 +133,8 @@ export default function EventsPage() {
                         {evt.severity}
                       </span>
                     </td>
-                    <td>
-                      {EVENT_ICONS[evt.event_type] ?? '⚡'}{' '}
+                    <td style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      {getEventIcon(evt.event_type)}
                       {evt.event_type.replace(/_/g, ' ')}
                     </td>
                     <td>
@@ -135,8 +150,8 @@ export default function EventsPage() {
                     </td>
                     <td>
                       {evt.alert_sent
-                        ? <span className="badge badge--success">✅ Đã gửi</span>
-                        : <span className="badge badge--medium">⏳ Chưa</span>
+                        ? <span className="badge badge--success">Đã gửi</span>
+                        : <span className="badge badge--medium">Chưa</span>
                       }
                     </td>
                   </tr>

@@ -1,0 +1,25 @@
+# SV-PRO Deploy Package — .gitignore
+
+# Models (lớn, không đi kèm source)
+models/
+**/*.onnx
+**/*.engine
+**/*.pt
+
+# Data thời gian thực
+Detect/
+output/
+logs/
+
+# Docker data (backup thủ công)
+*.sql.bak
+*.tar.gz
+
+# OS temp
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp

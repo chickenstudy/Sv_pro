@@ -1,79 +1,78 @@
-import { useState, useEffect, useCallback } from 'react'
-import { eventsApi, type EventStats, type AccessEvent } from '../api'
+import useSWR from 'swr'
+import { eventsApi } from '../api'
+import {
+  Activity,
+  AlertOctagon,
+  AlertCircle,
+  AlertTriangle,
+  CheckCircle,
+  BarChart3,
+  Camera as CameraIcon,
+  ShieldCheck,
+  RefreshCw,
+  Clock
+} from 'lucide-react'
 
 const SEV_COLOR: Record<string, string> = {
   CRITICAL: 'critical', HIGH: 'high', MEDIUM: 'medium', LOW: 'low',
 }
 
-/**
- * Trang Dashboard chính — hiển thị:
- *  - 4 stat cards: Tổng alert hôm nay, HIGH/CRITICAL, Medium, Low
- *  - Bar chart: phân bố theo mức độ nghiêm trọng
- *  - Alert feed: 20 event mới nhất, tự refresh mỗi 15 giây
- *  - Top 5 cameras kích hoạt cảnh báo nhiều nhất hôm nay
- */
+const SEV_LABELS = [
+  { id: 'CRITICAL', icon: AlertOctagon, cls: 'critical' },
+  { id: 'HIGH', icon: AlertCircle, cls: 'high' },
+  { id: 'MEDIUM', icon: AlertTriangle, cls: 'medium' },
+  { id: 'LOW', icon: CheckCircle, cls: 'low' },
+]
+
 export default function DashboardPage() {
-  const [stats, setStats]   = useState<EventStats | null>(null)
-  const [events, setEvents] = useState<AccessEvent[]>([])
-  const [loading, setLoading] = useState(true)
+  // Tự động fetch và refresh mỗi 10 giây bằng SWR
+  const {
+    data: stats,
+    isLoading: loadingStats,
+    mutate: mutateStats
+  } = useSWR('/api/events/stats', eventsApi.stats, { refreshInterval: 10000 })
 
-  const refresh = useCallback(async () => {
-    try {
-      const [s, e] = await Promise.all([
-        eventsApi.stats(),
-        eventsApi.list({ limit: 20 }),
-      ])
-      setStats(s)
-      setEvents(e)
-    } catch {
-      // silent — lỗi kết nối không crash UI
-    } finally {
-      setLoading(false)
-    }
-  }, [])
+  const {
+    data: events = [],
+    isLoading: loadingEvents,
+    mutate: mutateEvents
+  } = useSWR('/api/events?limit=20', () => eventsApi.list({ limit: 20 }), { refreshInterval: 10000 })
 
-  useEffect(() => {
-    refresh()
-    const id = setInterval(refresh, 15_000)
-    return () => clearInterval(id)
-  }, [refresh])
+  const handleRefresh = () => {
+    mutateStats()
+    mutateEvents()
+  }
 
   const bySev = stats?.by_severity ?? {}
   const maxSev = Math.max(1, ...Object.values(bySev))
-
-  const SEV_LABELS: [string, string, string][] = [
-    ['CRITICAL', '💀', 'critical'],
-    ['HIGH', '🔴', 'high'],
-    ['MEDIUM', '🟠', 'medium'],
-    ['LOW', '🟢', 'low'],
-  ]
+  const loading = loadingStats || loadingEvents
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
       {/* Stat cards */}
       <div className="stats-grid">
         <div className="stat-card" style={{ '--card-accent': 'var(--brand)' } as any}>
-          <span className="stat-card__icon">📊</span>
+          <Activity className="stat-card__icon" />
           <div className="stat-card__label">Tổng Alert Hôm Nay</div>
-          <div className="stat-card__value">{loading ? '—' : stats?.total ?? 0}</div>
+          <div className="stat-card__value">{loadingStats ? '—' : stats?.total ?? 0}</div>
           <div className="stat-card__sub">{stats?.date ?? '...'}</div>
         </div>
 
-        {SEV_LABELS.slice(0, 2).map(([sev, icon, cls]) => (
-          <div key={sev} className="stat-card" style={{ '--card-accent': `var(--sev-${cls})` } as any}>
-            <span className="stat-card__icon">{icon}</span>
-            <div className="stat-card__label">{sev}</div>
+        {SEV_LABELS.slice(0, 2).map(({ id, icon: Icon, cls }) => (
+          <div key={id} className="stat-card" style={{ '--card-accent': `var(--sev-${cls})` } as any}>
+            <Icon className="stat-card__icon" />
+            <div className="stat-card__label">{id}</div>
             <div className="stat-card__value" style={{ color: `var(--sev-${cls})` }}>
-              {loading ? '—' : bySev[sev] ?? 0}
+              {loadingStats ? '—' : bySev[id] ?? 0}
             </div>
           </div>
         ))}
 
         <div className="stat-card" style={{ '--card-accent': 'var(--success)' } as any}>
-          <span className="stat-card__icon">✅</span>
+          <CheckCircle className="stat-card__icon" />
           <div className="stat-card__label">LOW / MEDIUM</div>
           <div className="stat-card__value" style={{ color: 'var(--success)' }}>
-            {loading ? '—' : (bySev['LOW'] ?? 0) + (bySev['MEDIUM'] ?? 0)}
+            {loadingStats ? '—' : (bySev['LOW'] ?? 0) + (bySev['MEDIUM'] ?? 0)}
           </div>
         </div>
       </div>
@@ -82,24 +81,26 @@ export default function DashboardPage() {
       <div className="grid-2">
         {/* Bar chart */}
         <div className="card">
-          <div className="card__title">📈 Phân bố theo mức độ</div>
+          <div className="card__title">
+            <BarChart3 size={16} /> Phân bố cảnh báo
+          </div>
           <div className="chart-area" style={{ minHeight: 150 }}>
-            {SEV_LABELS.map(([sev, , cls]) => (
+            {SEV_LABELS.map(({ id, cls }) => (
               <div
-                key={sev}
+                key={id}
                 className="chart-bar"
-                title={`${sev}: ${bySev[sev] ?? 0}`}
+                title={`${id}: ${bySev[id] ?? 0}`}
                 style={{
-                  height: `${Math.max(4, ((bySev[sev] ?? 0) / maxSev) * 120)}px`,
+                  height: `${Math.max(4, ((bySev[id] ?? 0) / maxSev) * 120)}px`,
                   background: `linear-gradient(to top, var(--sev-${cls}), var(--sev-${cls})80)`,
                 }}
               />
             ))}
           </div>
           <div style={{ display: 'flex', justifyContent: 'space-around', marginTop: 8 }}>
-            {SEV_LABELS.map(([sev, icon]) => (
-              <span key={sev} style={{ fontSize: 10, color: 'var(--text-muted)' }}>
-                {icon} {sev.slice(0, 3)}
+            {SEV_LABELS.map(({ id, icon: Icon, cls }) => (
+              <span key={id} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, color: 'var(--text-muted)' }}>
+                <Icon size={12} style={{ color: `var(--sev-${cls})` }} /> {id.slice(0, 3)}
               </span>
             ))}
           </div>
@@ -107,11 +108,13 @@ export default function DashboardPage() {
 
         {/* Top cameras */}
         <div className="card">
-          <div className="card__title">📷 Top Camera Cảnh Báo</div>
-          {loading ? (
-            <div className="empty-state"><div className="empty-state__icon">⏳</div>Đang tải...</div>
+          <div className="card__title">
+            <CameraIcon size={16} /> Top Camera
+          </div>
+          {loadingStats ? (
+            <div className="empty-state"><Clock size={36} className="empty-state__icon" /> Đang tải...</div>
           ) : (stats?.top_cameras?.length ?? 0) === 0 ? (
-            <div className="empty-state"><div className="empty-state__icon">📷</div>Chưa có dữ liệu hôm nay</div>
+            <div className="empty-state"><ShieldCheck size={36} className="empty-state__icon" /> Chưa có dữ liệu</div>
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               {stats!.top_cameras.map((c, i) => (
@@ -139,15 +142,20 @@ export default function DashboardPage() {
       {/* Alert feed */}
       <div className="card">
         <div className="card__title" style={{ justifyContent: 'space-between' }}>
-          <span>🚨 Cảnh báo gần nhất</span>
-          <button className="btn btn--ghost btn--sm" onClick={refresh}>🔄 Refresh</button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Activity size={16} /> Cảnh báo gần nhất
+          </div>
+          <button className="btn btn--ghost btn--sm" onClick={handleRefresh}>
+            <RefreshCw size={14} className={loading ? "animate-spin" : ""} /> Tải lại
+          </button>
         </div>
-        {loading ? (
-          <div className="empty-state"><div className="empty-state__icon">⏳</div>Đang tải...</div>
+
+        {loadingEvents && events.length === 0 ? (
+          <div className="empty-state"><Clock size={36} className="empty-state__icon" /> Đang tải...</div>
         ) : events.length === 0 ? (
           <div className="empty-state">
-            <div className="empty-state__icon">🛡️</div>
-            Không có cảnh báo hôm nay — hệ thống an toàn
+            <ShieldCheck size={36} className="empty-state__icon" style={{ color: 'var(--success)' }} />
+            Hệ thống an toàn / Không có sự kiện
           </div>
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -163,7 +171,8 @@ export default function DashboardPage() {
                     {evt.event_type.replace(/_/g, ' ')} — {evt.entity_id ?? 'N/A'}
                   </div>
                   <div className="alert-item__meta">
-                    📷 {evt.camera_id ?? '?'} &nbsp;|&nbsp;
+                    <CameraIcon size={10} style={{ display: 'inline', verticalAlign: 'middle', marginRight: 2 }} />
+                    {evt.camera_id ?? '?'} &nbsp;|&nbsp;
                     {evt.reason ?? 'Không có mô tả'} &nbsp;|&nbsp;
                     <span className="font-mono">{new Date(evt.event_timestamp).toLocaleString('vi-VN')}</span>
                   </div>

@@ -1,0 +1,12 @@
+%YAML:1.0
+
+# NvSORT Tracker Config for DeepStream NvMultiObjectTracker
+# Mount: /opt/savant/user_data/tracker/config_tracker_NvSORT.yml
+
+BaseConfig:
+  minDetectorConfidence: 0.25
+
+NvSORT:
+  MatchingScoreWeight4Iou: 1.0
+  MatchingScoreWeight4VisualSimilarity: 0.0
+  useUniqueID: 1

@@ -1,40 +1,37 @@
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
+import useSWR from 'swr'
 import { usersApi, type User } from '../api'
+import {
+  Users, Shield, UserX, User as UserIcon, Plus, X, Clock, Save,
+  AlertTriangle, CheckCircle, Trash2, Ban
+} from 'lucide-react'
 
 const ROLE_BADGE: Record<string, string> = {
   staff: 'success', admin: 'brand', blacklist: 'critical', guest: 'medium',
 }
 
-const ROLE_LABEL: Record<string, string> = {
-  staff: '👔 Nhân viên', admin: '🛡️ Admin',
-  blacklist: '⛔ Blacklist', guest: '👤 Khách',
-}
-
-/**
- * Trang quản lý Người dùng — liệt kê nhân viên & blacklist,
- * thêm người mới, đổi role, vô hiệu hóa.
- */
 export default function UsersPage() {
-  const [users, setUsers]     = useState<User[]>([])
-  const [loading, setLoading] = useState(true)
-  const [filter, setFilter]   = useState<'all' | 'staff' | 'blacklist'>('all')
+  const [filter, setFilter] = useState<'all' | 'staff' | 'blacklist'>('all')
   const [showForm, setShowForm] = useState(false)
   const [form, setForm] = useState({
     person_id: '', name: '', role: 'staff', blacklist_reason: '',
   })
-  const [saving, setSaving]   = useState(false)
-  const [error, setError]     = useState('')
+  const [saving, setSaving] = useState(false)
+  const [formError, setFormError] = useState('')
 
-  const load = async () => {
-    setLoading(true)
-    try {
-      const params = filter === 'all' ? {} : { role: filter }
-      setUsers(await usersApi.list(params))
-    } catch (e: any) { setError(e.message) }
-    finally { setLoading(false) }
+  const getRoleIcon = (role: string) => {
+    switch (role) {
+      case 'staff': return <UserIcon size={14} className="inline mr-1" />
+      case 'admin': return <Shield size={14} className="inline mr-1" />
+      case 'blacklist': return <Ban size={14} className="inline mr-1" />
+      default: return <UserIcon size={14} className="inline mr-1" />
+    }
   }
 
-  useEffect(() => { load() }, [filter])
+  const { data: users = [], error, isLoading, mutate } = useSWR(
+    ['/api/users', filter],
+    () => usersApi.list(filter === 'all' ? {} : { role: filter })
+  )
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -43,22 +40,22 @@ export default function UsersPage() {
       await usersApi.create(form)
       setShowForm(false)
       setForm({ person_id: '', name: '', role: 'staff', blacklist_reason: '' })
-      load()
-    } catch (e: any) { setError(e.message) }
+      mutate()
+    } catch (e: any) { setFormError(e.message) }
     finally { setSaving(false) }
   }
 
   const handleDeactivate = async (id: number, name: string) => {
     if (!confirm(`Vô hiệu hóa người dùng "${name}"?`)) return
     await usersApi.deactivate(id)
-    load()
+    mutate()
   }
 
   const handleBlacklist = async (u: User) => {
     const reason = prompt(`Nhập lý do blacklist "${u.name}":`)
     if (!reason) return
     await usersApi.update(u.id, { role: 'blacklist', blacklist_reason: reason })
-    load()
+    mutate()
   }
 
   return (
@@ -66,7 +63,9 @@ export default function UsersPage() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h2 style={{ fontSize: 18, fontWeight: 700 }}>👥 Quản lý Người Dùng</h2>
+          <h2 style={{ fontSize: 18, fontWeight: 700, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Users size={22} color="var(--brand)" /> Quản lý Người Dùng
+          </h2>
           <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
             Nhân viên, khách và danh sách chú ý
           </p>
@@ -75,11 +74,11 @@ export default function UsersPage() {
           {(['all', 'staff', 'blacklist'] as const).map(f => (
             <button key={f} className={`btn btn--sm ${filter === f ? 'btn--primary' : 'btn--ghost'}`}
               onClick={() => setFilter(f)}>
-              {f === 'all' ? 'Tất cả' : f === 'staff' ? '👔 Nhân viên' : '⛔ Blacklist'}
+              {f === 'all' ? 'Tất cả' : f === 'staff' ? 'Nhân viên' : 'Blacklist'}
             </button>
           ))}
           <button className="btn btn--primary" onClick={() => setShowForm(v => !v)}>
-            {showForm ? '✕ Đóng' : '➕ Thêm'}
+            {showForm ? <><X size={16} /> Đóng</> : <><Plus size={16} /> Thêm</>}
           </button>
         </div>
       </div>
@@ -87,7 +86,7 @@ export default function UsersPage() {
       {/* Add form */}
       {showForm && (
         <div className="card">
-          <div className="card__title">➕ Thêm Người Dùng</div>
+          <div className="card__title"><Plus size={16} /> Thêm Người Dùng</div>
           <form onSubmit={handleCreate} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
             <div className="form-group">
               <label>Person ID *</label>
@@ -119,29 +118,32 @@ export default function UsersPage() {
                   placeholder="Nhập lý do..." />
               </div>
             )}
-            <div style={{ display: 'flex', alignItems: 'flex-end' }}>
+            <div style={{ display: 'flex', alignItems: 'flex-end', gap: 8 }}>
               <button type="submit" className="btn btn--primary" disabled={saving}>
-                {saving ? '⏳...' : '💾 Lưu'}
+                {saving ? <Clock size={16} className="animate-spin" /> : <Save size={16} />}
+                {saving ? ' Đang lưu...' : ' Lưu'}
               </button>
             </div>
           </form>
         </div>
       )}
 
-      {error && (
-        <div style={{ color: 'var(--danger)', fontSize: 12, padding: '8px 12px',
-          background: 'var(--danger)15', borderRadius: 'var(--r-md)' }}>
-          ❌ {error}
+      {(error || formError) && (
+        <div style={{
+          color: 'var(--danger)', fontSize: 12, padding: '8px 12px',
+          background: 'var(--danger)15', borderRadius: 'var(--r-md)'
+        }}>
+          ❌ {formError || error?.message || 'Có lỗi xảy ra'}
         </div>
       )}
 
       {/* Table */}
       <div className="card" style={{ padding: 0 }}>
         <div className="table-wrap">
-          {loading ? (
-            <div className="empty-state"><div className="empty-state__icon">⏳</div>Đang tải...</div>
+          {isLoading ? (
+            <div className="empty-state"><Clock size={36} className="empty-state__icon" /> Đang tải...</div>
           ) : users.length === 0 ? (
-            <div className="empty-state"><div className="empty-state__icon">👥</div>Không có người dùng nào</div>
+            <div className="empty-state"><UserX size={36} className="empty-state__icon" /> Không có người dùng nào</div>
           ) : (
             <table>
               <thead>
@@ -163,13 +165,13 @@ export default function UsersPage() {
                     <td className="font-mono">{u.person_id}</td>
                     <td>
                       <span className={`badge badge--${ROLE_BADGE[u.role] ?? 'info'}`}>
-                        {ROLE_LABEL[u.role] ?? u.role}
+                        {getRoleIcon(u.role)} {u.role.toUpperCase()}
                       </span>
                     </td>
                     <td>
                       {u.has_embedding
-                        ? <span className="badge badge--success">✅ Đã đăng ký</span>
-                        : <span className="badge badge--medium">⚠️ Chưa đăng ký</span>
+                        ? <span className="badge badge--success"><CheckCircle size={12} className="inline mr-1" /> Đã đăng ký</span>
+                        : <span className="badge badge--medium"><AlertTriangle size={12} className="inline mr-1" /> Chưa đăng ký</span>
                       }
                     </td>
                     <td className="text-muted text-sm">
@@ -178,12 +180,12 @@ export default function UsersPage() {
                     <td>
                       <div style={{ display: 'flex', gap: 4 }}>
                         {u.role !== 'blacklist' && (
-                          <button className="btn btn--sm btn--danger" onClick={() => handleBlacklist(u)}>
-                            ⛔
+                          <button className="btn btn--sm btn--danger" onClick={() => handleBlacklist(u)} title="Thêm vào Blacklist">
+                            <Ban size={14} />
                           </button>
                         )}
-                        <button className="btn btn--sm btn--ghost" onClick={() => handleDeactivate(u.id, u.name)}>
-                          🗑️
+                        <button className="btn btn--sm btn--ghost" onClick={() => handleDeactivate(u.id, u.name)} title="Xóa người dùng">
+                          <Trash2 size={14} />
                         </button>
                       </div>
                     </td>

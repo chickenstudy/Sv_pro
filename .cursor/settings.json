@@ -1,0 +1,10 @@
+{
+  "plugins": {
+    "redis-development": {
+      "enabled": true
+    },
+    "postman": {
+      "enabled": true
+    }
+  }
+}
