@@ -10,6 +10,7 @@ API key đọc từ env INTERNAL_API_KEY.
 """
 
 import os
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -18,13 +19,31 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer, APIKeyHea
 from pydantic import BaseModel
 
 # ── Cấu hình ───────────────────────────────────────────────────────────────────
-_JWT_SECRET    = os.environ.get("JWT_SECRET")
-_JWT_ALGO      = "HS256"
-_JWT_EXP_HOURS = 24
-_API_KEY       = os.environ.get("INTERNAL_API_KEY", "svpro-internal-key")
+_JWT_SECRET     = os.environ.get("JWT_SECRET")
+_JWT_ALGO       = "HS256"
+_JWT_EXP_HOURS  = 24
+
+# AI Core internal API key — bắt buộc phải set trong .env, không có fallback
+_INTERNAL_KEY = os.environ.get("INTERNAL_API_KEY")
+if not _INTERNAL_KEY:
+    if os.environ.get("ENVIRONMENT") == "production":
+        raise RuntimeError("INTERNAL_API_KEY must be set in production")
+    import logging
+    logging.getLogger(__name__).warning(
+        "INTERNAL_API_KEY not set — using temporary key for development only."
+    )
+    _INTERNAL_KEY = secrets.token_urlsafe(32)
 
 if not _JWT_SECRET:
-    raise RuntimeError("JWT_SECRET environment variable must be set in production")
+    if os.environ.get("ENVIRONMENT") == "production":
+        raise RuntimeError("JWT_SECRET must be set in production")
+    import logging
+    logging.getLogger(__name__).warning(
+        "JWT_SECRET not set — using temporary secret for development only."
+    )
+    _JWT_SECRET = "dev-jwt-secret-change-in-production"
+
+import jwt
 
 _bearer  = HTTPBearer(auto_error=False)
 _api_key = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -48,7 +67,6 @@ class TokenResponse(BaseModel):
 
 def _create_token(username: str) -> str:
     """Tạo JWT token với claim sub=username và exp=24h."""
-    import jwt  # lazy import để tránh circular dependency
     payload = {
         "sub": username,
         "exp": datetime.now(timezone.utc) + timedelta(hours=_JWT_EXP_HOURS),
@@ -59,7 +77,6 @@ def _create_token(username: str) -> str:
 
 def _verify_token(token: str) -> Optional[str]:
     """Giải mã JWT, trả về username nếu hợp lệ, None nếu không."""
-    import jwt  # lazy import
     from jwt.exceptions import InvalidTokenError
     try:
         payload = jwt.decode(token, _JWT_SECRET, algorithms=[_JWT_ALGO])
@@ -91,7 +108,7 @@ async def require_api_key(key: Optional[str] = Security(_api_key)) -> str:
     Dependency: Yêu cầu API Key hợp lệ trong header X-API-Key.
     Dùng cho endpoints nội bộ (AI Core gửi data).
     """
-    if not key or key != _API_KEY:
+    if not key or key != _INTERNAL_KEY:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="API Key không hợp lệ")
     return key
 

@@ -23,7 +23,7 @@ try:
 except ImportError:  # pragma: no cover
     Instrumentator = None
 
-from .routers import cameras, users, vehicles, events, health, auth, doors, strangers, metrics
+from .routers import cameras, users, vehicles, events, health, auth, doors, strangers, metrics, stream
 from .database import init_db
 
 # ── Cấu hình từ biến môi trường ────────────────────────────────────────────────
@@ -84,3 +84,4 @@ app.include_router(events.router,    prefix="/api/events",    tags=["Events"])
 app.include_router(doors.router,     prefix="/api/doors",     tags=["Doors"])
 app.include_router(strangers.router, prefix="/api/strangers", tags=["Strangers"])
 app.include_router(metrics.router,   prefix="/api/metrics",   tags=["Metrics"])
+app.include_router(stream.router,   prefix="",               tags=["Stream"])

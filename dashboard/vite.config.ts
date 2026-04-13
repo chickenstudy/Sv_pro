@@ -8,12 +8,18 @@ export default defineConfig({
   resolve: {
     alias: { '@': path.resolve(__dirname, 'src') },
   },
-  server: {
+    server: {
     port: 3000,
     // Proxy API requests đến FastAPI backend (tránh CORS khi dev)
     proxy: {
       '/api': {
         target: 'http://localhost:8000',
+        changeOrigin: true,
+      },
+      // Proxy WebSocket cho camera stream (jsmpeg)
+      '/ws': {
+        target: 'ws://localhost:8000',
+        ws: true,
         changeOrigin: true,
       },
     },

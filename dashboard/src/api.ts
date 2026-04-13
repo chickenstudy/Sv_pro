@@ -2,7 +2,7 @@
 // Tất cả request đến FastAPI backend đều đi qua module này.
 // Tự động đính kèm JWT token từ localStorage vào header Authorization.
 
-const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+const BASE_URL = import.meta.env.VITE_API_URL || 'http://192.168.42.171:8000'  // '' = relative path, Nginx proxy /api/* → backend:8000
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
 
@@ -39,7 +39,7 @@ async function apiFetch<T>(
 
   if (res.status === 401) {
     clearToken()
-    window.location.href = '/login'
+    window.dispatchEvent(new CustomEvent('svpro:auth-required'))
     throw new Error('Phiên đăng nhập hết hạn')
   }
 
@@ -100,11 +100,11 @@ export const eventsApi = {
     offset?: number
   }) => {
     const q = new URLSearchParams()
-    if (params?.camera_id)  q.set('camera_id', params.camera_id)
-    if (params?.severity)   q.set('severity', params.severity)
+    if (params?.camera_id) q.set('camera_id', params.camera_id)
+    if (params?.severity) q.set('severity', params.severity)
     if (params?.event_type) q.set('event_type', params.event_type)
-    if (params?.limit)      q.set('limit', String(params.limit))
-    if (params?.offset)     q.set('offset', String(params.offset))
+    if (params?.limit) q.set('limit', String(params.limit))
+    if (params?.offset) q.set('offset', String(params.offset))
     return apiFetch<AccessEvent[]>(`/api/events?${q}`)
   },
 
@@ -153,9 +153,9 @@ export interface User {
 export const usersApi = {
   list: (params?: { role?: string; active?: boolean; limit?: number }) => {
     const q = new URLSearchParams()
-    if (params?.role)   q.set('role', params.role)
+    if (params?.role) q.set('role', params.role)
     if (params?.active !== undefined) q.set('active', String(params.active))
-    if (params?.limit)  q.set('limit', String(params.limit))
+    if (params?.limit) q.set('limit', String(params.limit))
     return apiFetch<User[]>(`/api/users?${q}`)
   },
   get: (id: number) => apiFetch<User>(`/api/users/${id}`),

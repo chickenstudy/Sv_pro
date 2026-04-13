@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
+import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import {
   LayoutDashboard,
   Camera as CameraIcon,
@@ -42,11 +42,10 @@ const PAGE_TITLES: Record<string, string> = {
 
 // ── AppShell Component (Layout chính) ────────────────────────────────────────
 
-export default function AppShell() {
+export default function AppShell({ onLogout }: { onLogout: () => void }) {
   const [collapsed, setCollapsed] = useState(false)
   const [time, setTime] = useState(() => new Date().toLocaleTimeString('vi-VN'))
   const location = useLocation()
-  const navigate = useNavigate()
 
   useEffect(() => {
     const id = setInterval(() => setTime(new Date().toLocaleTimeString('vi-VN')), 1000)
@@ -56,7 +55,7 @@ export default function AppShell() {
   const handleLogout = () => {
     if (confirm('Đăng xuất khỏi SV-PRO?')) {
       clearToken()
-      navigate('/login')
+      onLogout()
     }
   }
 

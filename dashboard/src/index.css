@@ -832,6 +832,98 @@ label {
   width: 120px;
 }
 
+/* ── Camera Stream Tiles ─────────────────────────────────────────────────── */
+.cam-grid {
+  display: grid;
+  gap: 16px;
+}
+
+.cam-tile {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+  transition: border-color var(--t-quick);
+}
+
+.cam-tile:hover { border-color: var(--border-bright); }
+
+.cam-tile__video {
+  position: relative;
+  aspect-ratio: 16/9;
+  background: #000;
+  overflow: hidden;
+}
+
+.cam-tile__canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+
+.cam-tile__overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+  text-align: center;
+  padding: 12px;
+}
+
+.cam-tile__overlay--loading {
+  background: rgba(0,0,0,0.7);
+  color: var(--text-secondary);
+}
+
+.cam-tile__overlay--error {
+  background: rgba(0,0,0,0.8);
+  color: var(--danger);
+}
+
+.cam-tile__overlay--disabled {
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+}
+
+.cam-tile__info {
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-top: 1px solid var(--border);
+}
+
+.cam-tile__name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.cam-tile__meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.cam-tile__actions {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  gap: 4px;
+}
+
+.cam-tile__actions .btn {
+  background: rgba(0,0,0,0.6);
+  backdrop-filter: blur(4px);
+}
+
 /* ── Loading States ───────────────────────────────────────────────────────── */
 .loading-state {
   display: flex;

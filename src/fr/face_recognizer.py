@@ -330,8 +330,18 @@ class FaceRecognizer(NvDsPyFuncPlugin):
                     "id": uid, "name": name, "role": role,
                     "embedding": emb.tolist(),
                 })
-                pipe.setex(key, 300, payload)   # TTL = 5 phút
+                # Store all staff in a Redis Hash: HSET svpro:staff:hash uid → JSON
+            pipe.delete("svpro:staff:hash")   # Reset if re-prefetching
+            count = 0
+            for uid, name, role, embedding_str in rows:
+                emb = np.array(json.loads(embedding_str), dtype=np.float32)
+                payload = json.dumps({
+                    "id": uid, "name": name, "role": role,
+                    "embedding": emb.tolist(),
+                })
+                pipe.hset("svpro:staff:hash", uid, payload)
                 count += 1
+            pipe.expire("svpro:staff:hash", 300)   # TTL = 5 phút
             pipe.execute()
             cur.close()
             conn.close()
@@ -717,29 +727,23 @@ class FaceRecognizer(NvDsPyFuncPlugin):
 
     def _match_redis(self, embedding: np.ndarray) -> Optional[dict]:
         """
-        Tầng 1: so sánh cosine similarity với tất cả staff đã prefetch trong Redis.
-        Brute-force trên tập nhỏ (<2000 nhân viên) — đủ nhanh cho production.
-        Trả về dict {id, name, role, score} hoặc None nếu không match.
+        Tầng 1: dùng HGETALL trên Redis Hash (O(1) per field, không block).
+        Brute-force cosine similarity trên toàn bộ staff hash.
         """
         if self._redis is None:
             return None
         try:
-            keys = self._redis.keys("svpro:staff:*")
-            if not keys:
+            raw_map = self._redis.hgetall("svpro:staff:hash")
+            if not raw_map:
                 return None
 
             best_score  = 0.0
             best_person = None
 
-            for key in keys:
-                # Redis client có thể trả về bytes hoặc string tùy phiên bản
+            for key, raw in raw_map.items():
                 lookup_key = key.decode() if isinstance(key, bytes) else key
-                raw = self._redis.get(lookup_key)
-                if not raw:
-                    continue
-                person  = json.loads(raw)
+                person = json.loads(raw)
                 ref_emb = np.array(person["embedding"], dtype=np.float32)
-                # Cosine similarity — cả 2 vector đã L2-normalized nên dot = cosine
                 sim = float(np.dot(embedding, ref_emb))
                 if sim > best_score:
                     best_score  = sim
@@ -807,17 +811,14 @@ class FaceRecognizer(NvDsPyFuncPlugin):
         return None
 
     def _cache_pgvector_result(self, person: dict) -> None:
-        """
-        Cache kết quả pgvector trở lại Redis để lần sau tra cứu nhanh hơn.
-        TTL = 5 phút (giống staff prefetch).
-        """
+        """Cache kết quả pgvector vào Redis Hash (key=uid) để lần sau HGETALL."""
         if self._redis is None or not person.get("id"):
             return
         try:
-            key     = f"svpro:staff:{person['id']}"
+            uid     = person["id"]
             payload = json.dumps(person)
-            self._redis.setex(key, 300, payload)
-            logger.debug("pgvector result cached to Redis: key=%s", key)
+            self._redis.hset("svpro:staff:hash", uid, payload)
+            logger.debug("pgvector result cached to Redis: uid=%s", uid)
         except Exception as exc:
             logger.debug("Redis cache write failed: %s", exc)
 
@@ -866,7 +867,7 @@ class FaceRecognizer(NvDsPyFuncPlugin):
             if stranger_registry is not None:
                 stranger_registry.register(
                     stranger_id=stranger_id,
-                    embedding=state.centroid,
+                    embedding=state.mean_embedding(),
                     camera_id=source_id,
                     extra={"quality_frames": state.quality_frames},
                 )

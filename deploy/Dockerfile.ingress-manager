@@ -1,4 +1,0 @@
-FROM ghcr.io/insight-platform/savant-adapters-gstreamer:latest
-
-# Install psycopg2 for DB access in ingress_manager.py
-RUN pip install --no-cache-dir psycopg2-binary

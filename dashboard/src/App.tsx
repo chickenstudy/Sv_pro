@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { isLoggedIn } from './api'
 import LoginPage from './pages/LoginPage'
@@ -15,25 +15,32 @@ import './index.css'
 
 /**
  * Root Router — quản lý auth state và React Router v6.
+ * BrowserRouter wrap toàn bộ để tránh unmount/remount router context khi login.
  */
 export default function App() {
   const [loggedIn, setLoggedIn] = useState(isLoggedIn())
 
-  // Lắng nghe sự kiện login changes (từ api.ts hoặc các tab khác)
-  useEffect(() => {
-    const handleStorage = () => setLoggedIn(isLoggedIn())
-    window.addEventListener('storage', handleStorage)
-    return () => window.removeEventListener('storage', handleStorage)
+  const handleLogin = useCallback(() => {
+    setLoggedIn(true)
   }, [])
 
-  if (!loggedIn) {
-    return <LoginPage onLogin={() => setLoggedIn(true)} />
-  }
+  const handleLogout = useCallback(() => {
+    setLoggedIn(false)
+  }, [])
+
+  // Lắng nghe event từ api.ts khi token hết hạn (401)
+  useEffect(() => {
+    const handler = () => setLoggedIn(false)
+    window.addEventListener('svpro:auth-required', handler)
+    return () => window.removeEventListener('svpro:auth-required', handler)
+  }, [])
 
   return (
-    <BrowserRouter>
-      <Routes>
-        <Route path="/" element={<AppShell />}>
+    <Routes>
+      {!loggedIn ? (
+        <Route path="*" element={<LoginPage onLogin={handleLogin} />} />
+      ) : (
+        <Route path="/*" element={<AppShell onLogout={handleLogout} />}>
           <Route index element={<DashboardPage />} />
           <Route path="cameras" element={<CamerasPage />} />
           <Route path="users" element={<UsersPage />} />
@@ -42,9 +49,10 @@ export default function App() {
           <Route path="alerts" element={<AlertsPage />} />
           <Route path="strangers" element={<StrangersPage />} />
           <Route path="doors" element={<DoorsPage />} />
+          <Route path="login" element={<Navigate to="/" replace />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>
-      </Routes>
-    </BrowserRouter>
+      )}
+    </Routes>
   )
 }

@@ -6,14 +6,17 @@ services:
       dockerfile: Dockerfile.ingress-manager
     restart: unless-stopped
     entrypoint: python
-    command: ["/opt/savant/user_data/src/ingress/ingress_manager.py"]
+    command: [ "/opt/savant/user_data/src/ingress/ingress_manager.py" ]
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
       - .:/opt/savant/user_data
       - zmq-sockets:/tmp/zmq-sockets
+    networks:
+      - svpro-net
     environment:
+      - PYTHONPATH=/opt/savant:/opt/savant/user_data
       - POSTGRES_DSN=postgresql://${POSTGRES_USER:-svpro_user}:${POSTGRES_PASSWORD:-svpro_pass}@postgres:5432/${POSTGRES_DB:-svpro_db}
       - ZMQ_ENDPOINT=pub+connect:ipc:///tmp/zmq-sockets/input-video.ipc
       - POLL_INTERVAL_SECS=10
@@ -23,6 +26,11 @@ services:
       - EOS_THRESHOLD=5
       - EOS_WINDOW_SECS=1.0
       - GST_PLUGIN_PATH=/opt/savant/adapters/gst/gst_plugins
+    healthcheck:
+      test: [ "CMD-SHELL", "pgrep -f ingress_manager || exit 1" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
   # ── AI Core: GPU Pipeline xử lý LPR + FR ──
   savant-ai-core:
@@ -37,7 +45,7 @@ services:
       db-init:
         condition: service_completed_successfully
     ports:
-      - "8080:8080" # Metrics / Health
+      - "9080:8080" # 9080 trên host → tránh trùng với VMS API (8080)
     volumes:
       - .:/opt/savant/user_data
       - zmq-sockets:/tmp/zmq-sockets
@@ -61,12 +69,13 @@ services:
           devices:
             - driver: nvidia
               count: 1
-              capabilities: [gpu]
+              capabilities: [ gpu ]
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=30)"]
+      test: [ "CMD-SHELL", "pgrep -f 'module.yml' || exit 1" ]
       interval: 30s
-      timeout: 30s
-      retries: 5
+      timeout: 10s
+      retries: 10
+      start_period: 120s # Savant cần ~60-120s để load model TensorRT lần đầu
 
   # ── Egress: Xuất JSON metadata ──
   json-egress:
@@ -75,9 +84,14 @@ services:
     entrypoint: python
     command:
       - /opt/savant/adapters/python/sinks/metadata_json.py
+    depends_on:
+      savant-ai-core:
+        condition: service_healthy
     volumes:
       - zmq-sockets:/tmp/zmq-sockets
       - ./output:/output
+    networks:
+      - svpro-net
     environment:
       - ZMQ_ENDPOINT=sub+connect:ipc:///tmp/zmq-sockets/output-video.ipc
       - ZMQ_TYPE=SUB
@@ -90,13 +104,15 @@ services:
 
   # ── Egress: Always-On RTSP Video Output (cần Linux + DeepStream adapter) ──
   video-egress:
-    profiles: ["rtsp-out"]  # Chỉ chạy khi: docker compose --profile rtsp-out up
+    profiles: [ "rtsp-out" ] # Chỉ chạy khi: docker compose --profile rtsp-out up
     image: ghcr.io/insight-platform/savant-adapters-gstreamer:latest
     restart: unless-stopped
     entrypoint: /opt/savant/adapters/gst/sinks/always_on_rtsp.sh
     ports:
-      - "554:554"     # RTSP output
-      - "888:888"     # Player HTTP
+      - "554:554" # RTSP output
+      - "888:888" # Player HTTP
+    networks:
+      - svpro-net
     environment:
       - ZMQ_ENDPOINT=sub+connect:ipc:///tmp/zmq-sockets/output-video.ipc
       - SOURCE_ID=cam_online_1
@@ -115,15 +131,18 @@ services:
     container_name: svpro_postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER:     ${POSTGRES_USER:-svpro_user}
+      POSTGRES_USER: ${POSTGRES_USER:-svpro_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-svpro_pass}
-      POSTGRES_DB:       ${POSTGRES_DB:-svpro_db}
+      POSTGRES_DB: ${POSTGRES_DB:-svpro_db}
     ports:
-      - "5432:5432"
+      - "5433:5432" # 5433 trên host → tránh trùng với VMS postgres (5432)
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./postgres/pg_hba.conf:/etc/postgresql/16/main/pg_hba.conf:ro
+    networks:
+      - svpro-net
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-svpro_user}"]
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-svpro_user}" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -135,17 +154,52 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      PGPASSWORD: ${POSTGRES_PASSWORD:-svpro_pass}
+      POSTGRES_USER: ${POSTGRES_USER:-svpro_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-svpro_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-svpro_db}
     volumes:
       - ./scripts/sql:/sql
+    networks:
+      - svpro-net
+    # Fix: dùng $$VAR thay vì ${VAR} — Docker Compose escape 1 lớp $ trước khi truyền vào bash
+    # Tạo database svpro_db nếu chưa tồn tại (postgres superuser mới có quyền CREATE DATABASE)
+    # Sau đó chạy schema + migration + seed
     command: >
       bash -c "
-        psql -h postgres -U ${POSTGRES_USER:-svpro_user} -d ${POSTGRES_DB:-svpro_db} -f /sql/schema.sql &&
-        psql -h postgres -U ${POSTGRES_USER:-svpro_user} -d ${POSTGRES_DB:-svpro_db} -f /sql/migrations/001_sprint4_5.sql &&
-        psql -h postgres -U ${POSTGRES_USER:-svpro_user} -d ${POSTGRES_DB:-svpro_db} -f /sql/seed_cameras.sql &&
-        echo '✅ DB migrations + seed applied.'
+        echo '▶ Bước 1: Tạo database nếu chưa có...'
+        PGPASSWORD=$$POSTGRES_PASSWORD psql -h postgres -U $$POSTGRES_USER -tc \"SELECT 1 FROM pg_database WHERE datname='$$POSTGRES_DB'\" | grep -q 1 || \\
+        PGPASSWORD=$$POSTGRES_PASSWORD psql -h postgres -U $$POSTGRES_USER -c \"CREATE DATABASE $$POSTGRES_DB\"
+        echo '✅ Database sẵn sàng.'
+        echo '▶ Bước 2: Grant quyền...'
+        PGPASSWORD=$$POSTGRES_PASSWORD psql -h postgres -U $$POSTGRES_USER -d $$POSTGRES_DB -c \"GRANT ALL ON SCHEMA public TO $$POSTGRES_USER\"
+        echo '▶ Bước 3: Chạy schema...'
+        PGPASSWORD=$$POSTGRES_PASSWORD psql -h postgres -U $$POSTGRES_USER -d $$POSTGRES_DB -f /sql/schema.sql
+        echo '▶ Bước 4: Chạy migration...'
+        PGPASSWORD=$$POSTGRES_PASSWORD psql -h postgres -U $$POSTGRES_USER -d $$POSTGRES_DB -f /sql/migrations/001_sprint4_5.sql
+        echo '▶ Bước 5: Seed cameras...'
+        PGPASSWORD=$$POSTGRES_PASSWORD psql -h postgres -U $$POSTGRES_USER -d $$POSTGRES_DB -f /sql/seed_cameras.sql
+        echo '🎉 DB migrations + seed hoàn tất.'
       "
     restart: "no"
+
+  # ── Frontend: Nginx serve SPA static files ──────────────────────────────
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: svpro_frontend
+    restart: unless-stopped
+    ports:
+      - "8081:80"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - svpro-net
+    healthcheck:
+      test: [ "CMD-SHELL", "wget -qO- http://localhost:80 || exit 1" ]
+      interval: 15s
+      timeout: 5s
+      retries: 3
 
   # ── FastAPI Backend ──
   backend:
@@ -159,18 +213,26 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
     ports:
       - "8000:8000"
     env_file:
       - .env
     environment:
       POSTGRES_DSN: postgresql://${POSTGRES_USER:-svpro_user}:${POSTGRES_PASSWORD:-svpro_pass}@postgres:5432/${POSTGRES_DB:-svpro_db}
-      REDIS_HOST:   redis
+      REDIS_HOST: redis
+      # CORS: cho phép frontend (nginx) truy cập từ mọi origin (localhost + IP thực)
+      # Quan trọng: FE dùng relative path /api/* qua nginx proxy, không hardcode IP ở browser
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:5173,http://localhost:8081,http://192.168.42.171:8081,http://192.168.42.171}
+    networks:
+      - svpro-net
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" ]
       interval: 20s
-      timeout: 5s
+      timeout: 15s
       retries: 5
+      start_period: 30s
 
   # ── Redis (Hot Cache) ──
   redis:
@@ -181,8 +243,10 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
+    networks:
+      - svpro-net
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -197,6 +261,8 @@ services:
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
+    networks:
+      - svpro-net
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
@@ -205,7 +271,7 @@ services:
       - '--web.console.templates=/usr/share/prometheus/consoles'
       - '--web.enable-lifecycle'
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9090/-/healthy" ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -216,22 +282,22 @@ services:
     container_name: svpro_grafana
     restart: unless-stopped
     ports:
-      - "3001:3000"   # 3001 để tránh conflict với React dev server
+      - "3001:3000" # 3001 để tránh conflict với React dev server
     volumes:
       - grafana_data:/var/lib/grafana
       - ./monitoring/grafana/dashboard.json:/var/lib/grafana/dashboards/svpro.json:ro
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
     environment:
-      GF_SECURITY_ADMIN_USER:     ${GF_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_USER: ${GF_ADMIN_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GF_ADMIN_PASS:-svpro2024}
-      GF_USERS_ALLOW_SIGN_UP:     "false"
-      GF_SERVER_ROOT_URL:         "http://localhost:3001"
-      GF_FEATURE_TOGGLES_ENABLE:  "publicDashboards"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: "http://localhost:3001"
+      GF_FEATURE_TOGGLES_ENABLE: "publicDashboards"
     depends_on:
       prometheus:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/api/health" ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -248,6 +314,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    networks:
+      - svpro-net
 
   # ── PostgreSQL Exporter ──
   postgres-exporter:
@@ -257,10 +325,12 @@ services:
     environment:
       DATA_SOURCE_NAME: postgresql://${POSTGRES_USER:-svpro_user}:${POSTGRES_PASSWORD:-svpro_pass}@postgres:5432/${POSTGRES_DB:-svpro_db}?sslmode=disable
     ports:
-      - "9187:9187"
+      - "9188:9187" # 9188 trên host → tránh trùng nếu có service khác dùng 9187
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - svpro-net
 
 volumes:
   zmq-sockets:
@@ -268,4 +338,9 @@ volumes:
   redis_data:
   prometheus_data:
   grafana_data:
+
+networks:
+  svpro-net:
+    driver: bridge
+
 

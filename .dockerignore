@@ -1,0 +1,50 @@
+# Git
+.git
+.gitignore
+
+# IDE
+.agent
+.cursor
+.vscode
+*.swp
+*.swo
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv
+venv/
+ENV/
+.pytest_cache/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+*.whl
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Development files
+tests/
+dashboard/
+config/

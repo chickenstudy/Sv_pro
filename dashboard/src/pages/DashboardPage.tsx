@@ -1,5 +1,5 @@
 import useSWR from 'swr'
-import { eventsApi } from '../api'
+import { camerasApi, eventsApi } from '../api'
 import {
   Activity,
   AlertOctagon,
@@ -10,8 +10,10 @@ import {
   Camera as CameraIcon,
   ShieldCheck,
   RefreshCw,
-  Clock
+  Clock,
+  Video,
 } from 'lucide-react'
+import { CameraGrid } from '../components/CameraStream'
 
 const SEV_COLOR: Record<string, string> = {
   CRITICAL: 'critical', HIGH: 'high', MEDIUM: 'medium', LOW: 'low',
@@ -25,21 +27,30 @@ const SEV_LABELS = [
 ]
 
 export default function DashboardPage() {
-  // Tự động fetch và refresh mỗi 10 giây bằng SWR
+  // Event stats — refresh mỗi 10s
   const {
     data: stats,
     isLoading: loadingStats,
-    mutate: mutateStats
+    mutate: mutateStats,
   } = useSWR('/api/events/stats', eventsApi.stats, { refreshInterval: 10000 })
 
+  // Camera list — refresh mỗi 30s
+  const {
+    data: cameras = [],
+    isLoading: loadingCams,
+    mutate: mutateCams,
+  } = useSWR('/api/cameras', camerasApi.list, { refreshInterval: 30000 })
+
+  // Event feed — refresh mỗi 10s
   const {
     data: events = [],
     isLoading: loadingEvents,
-    mutate: mutateEvents
+    mutate: mutateEvents,
   } = useSWR('/api/events?limit=20', () => eventsApi.list({ limit: 20 }), { refreshInterval: 10000 })
 
   const handleRefresh = () => {
     mutateStats()
+    mutateCams()
     mutateEvents()
   }
 
@@ -75,6 +86,20 @@ export default function DashboardPage() {
             {loadingStats ? '—' : (bySev['LOW'] ?? 0) + (bySev['MEDIUM'] ?? 0)}
           </div>
         </div>
+      </div>
+
+      {/* Live Camera Preview */}
+      <div className="card">
+        <div className="card__title">
+          <Video size={16} /> Video trực tiếp
+        </div>
+        {loadingCams ? (
+          <div className="empty-state">
+            <Clock size={36} className="empty-state__icon" /> Đang tải danh sách camera...
+          </div>
+        ) : (
+          <CameraGrid cameras={cameras} />
+        )}
       </div>
 
       {/* Charts + Top cameras */}

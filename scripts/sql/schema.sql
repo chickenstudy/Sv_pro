@@ -43,7 +43,7 @@ CREATE INDEX IF NOT EXISTS idx_vehicles_blacklist  ON vehicles (is_blacklisted) 
 -- ── Bảng log nhận diện (Vehicle / Person) ──────────────────────────────────────
 -- Phân vùng theo tháng để hiệu năng truy vấn tốt hơn với dữ liệu lớn
 CREATE TABLE IF NOT EXISTS recognition_logs (
-    event_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_id       UUID DEFAULT gen_random_uuid(),
     created_at     TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     source_id      VARCHAR(50) NOT NULL,
     camera_id      VARCHAR(50),
@@ -54,8 +54,12 @@ CREATE TABLE IF NOT EXISTS recognition_logs (
     plate_number   VARCHAR(20),
     plate_category VARCHAR(30),
     ocr_confidence FLOAT,
-    metadata_json  JSONB
+    metadata_json  JSONB,
+    PRIMARY KEY (event_id, created_at)
 ) PARTITION BY RANGE (created_at);
+
+-- Unique index trên event_id (để query nhanh theo event_id)
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reclogs_event_id ON recognition_logs (event_id);
 
 -- Tạo partition tháng hiện tại và 2 tháng tiếp theo
 DO $$

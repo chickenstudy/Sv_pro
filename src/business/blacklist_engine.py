@@ -221,7 +221,7 @@ class BlacklistEngine:
             )
 
         # ── 2. Kiểm tra zone access (nếu là stranger hoặc unknown role) ─────────
-        zone = self._camera_zones.get(camera_id) or self._camera_zones.get(source_id)
+        zone = self._camera_zones.get(camera_id)
         if zone:
             allowed_roles = self._zone_access.get(zone, [])
             if allowed_roles and person_role not in allowed_roles:
