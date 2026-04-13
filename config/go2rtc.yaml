@@ -1,0 +1,36 @@
+# go2rtc Configuration — SV-PRO
+# Tài liệu: https://github.com/AlexxIT/go2rtc
+
+# ── API & WebUI ───────────────────────────────────────────────────────────────
+api:
+  listen: ":1984"    # HTTP API + WebUI tại http://localhost:1984
+  # SECURITY: origin: "*" cho phép mọi domain gọi go2rtc REST API (thêm/xóa streams).
+  # Chấp nhận được khi port 1984 chỉ expose trong mạng nội bộ (không forward ra internet).
+  # Nếu deploy production với port 1984 public: đổi thành origin của frontend cụ thể,
+  # ví dụ: origin: "http://your-dashboard-domain.com"
+  origin: "*"
+
+# ── RTSP Server (re-stream cho Savant AI Core) ────────────────────────────────
+rtsp:
+  listen: ":8554"    # Savant đọc RTSP từ go2rtc tại rtsp://go2rtc:8554/{source_id}
+
+# ── WebRTC (Browser stream trực tiếp, không qua backend FFmpeg) ───────────────
+webrtc:
+  listen: ":8555"    # WebRTC signaling
+  # STUN server cho LAN — không cần TURN nếu client trong cùng mạng
+  ice_servers:
+    - urls: [stun:stun.l.google.com:19302]
+
+# ── Streams ───────────────────────────────────────────────────────────────────
+# Streams sẽ được go2rtc_sync.py thêm vào ĐỘNG qua REST API
+# khi startup và khi camera DB thay đổi (PG LISTEN/NOTIFY).
+#
+# Ví dụ stream tĩnh để test (sẽ bị override bởi go2rtc_sync.py):
+# streams:
+#   cam_01: rtsp://admin:pass@192.168.1.100:554/stream1
+#
+# Sau khi go2rtc_sync.py chạy, streams sẽ được thêm tự động từ DB.
+
+# ── Log Level ─────────────────────────────────────────────────────────────────
+log:
+  level: info        # debug | info | warn | error

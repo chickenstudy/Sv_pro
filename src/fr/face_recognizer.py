@@ -31,6 +31,7 @@ from savant.deepstream.opencv_utils import nvds_to_gpu_mat
 
 from .face_quality import compute_quality_score, _MIN_COMPOSITE
 from .stranger_reid import stranger_registry
+from .enrollment_service import start_enrollment_server
 from src.telemetry import metrics
 
 logger = logging.getLogger(__name__)
@@ -218,6 +219,13 @@ class FaceRecognizer(NvDsPyFuncPlugin):
             self._init_models()
             self._init_redis()
             self._prefetch_staff_embeddings()
+            # Khởi động Enrollment HTTP server — tái dụng SCRFD + ArcFace đã load
+            # Chạy trên port 8090 (internal), không block pipeline (daemon thread)
+            start_enrollment_server(
+                scrfd_session   = self._scrfd,
+                arcface_session = self._arcface,
+                port            = int(os.environ.get("ENROLLMENT_PORT", "8090")),
+            )
         except Exception as exc:
             # Degrade gracefully: keep pipeline alive even if FR deps/models
             # are not available in the current environment.

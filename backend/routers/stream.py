@@ -1,230 +1,161 @@
 """
-Router streaming video — FastAPI backend SV-PRO.
+Router streaming video — FastAPI backend SV-PRO (Refactored).
 
-Cung cấp stream video từ camera RTSP đến browser qua WebSocket.
-Sử dụng FFmpeg subprocess để decode RTSP và forward MPEG-TS frame
-sang WebSocket client (jsmpeg format).
+Trước: spawn FFmpeg subprocess → MPEG-TS → WebSocket (jsmpeg).
+Sau:   proxy URL/token của go2rtc → Browser tự kết nối WebRTC/HLS trực tiếp.
 
-Cách hoạt động:
-  Browser (jsmpeg) → WebSocket /ws/stream/{camera_id}
-  → Backend: FFmpeg decode RTSP → MPEG-TS → forward binary frames
-  → Browser: jsmpeg player hiển thị video
+Lý do thay đổi:
+  - go2rtc xử lý RTSP → WebRTC/HLS/MSE hiệu quả hơn FFmpeg subprocess.
+  - Browser kết nối trực tiếp go2rtc — không tốn tài nguyên backend.
+  - Không cần spawn process, không cần quản lý pipe, không cần jsmpeg.
 
 Endpoints:
-  WS /ws/stream/{camera_id}  — Video stream (binary MPEG-TS frames)
-  GET /api/stream/{camera_id}/status — Trạng thái stream của camera
+  GET /api/stream/{cam_id}/info      — URL go2rtc cho camera (WebRTC + HLS + RTSP)
+  GET /api/stream/{cam_id}/status    — Trạng thái stream từ go2rtc API
+  GET /api/stream/active             — Danh sách streams đang active trên go2rtc
 """
 
-import asyncio
-import subprocess
-import shlex
 import logging
+import os
 from typing import Optional
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends
+
+import httpx
+from fastapi import APIRouter, Depends, HTTPException
+
 from ..database import get_db
 from .auth import require_jwt
 
 router = APIRouter()
 logger = logging.getLogger("stream")
 
-# Cache camera config để tránh query DB mỗi frame
-_camera_cache: dict[int, dict] = {}
-_cache_ttl = 0
+# ── go2rtc config ─────────────────────────────────────────────────────────────
+GO2RTC_URL      = os.environ.get("GO2RTC_URL", "http://go2rtc:1984")
+GO2RTC_RTSP_URL = os.environ.get("GO2RTC_RTSP_URL", "rtsp://go2rtc:8554")
+
+# HTTP client để gọi go2rtc API
+_go2rtc_client = httpx.AsyncClient(base_url=GO2RTC_URL, timeout=5.0)
+
+# Cache camera config để tránh query DB mỗi request
+# {cam_id: (data_dict, expire_timestamp)}
+_camera_cache: dict[int, tuple[dict, float]] = {}
 _CACHE_TTL_SEC = 30
 
 
-async def _get_cached_camera(cam_id: int) -> Optional[dict]:
-    """Lấy camera config từ cache hoặc DB."""
-    global _camera_cache, _cache_ttl
+async def _get_cached_camera(cam_id: int, db) -> Optional[dict]:
+    """Lấy camera config từ cache hoặc DB. Nhận db connection từ endpoint (Depends)."""
     import time
+    global _camera_cache
 
     now = time.time()
-    cached = _camera_cache.get(cam_id)
-    if cached and _cache_ttl > now:
-        return cached
+    cached_entry = _camera_cache.get(cam_id)
+    if cached_entry:
+        data, expire_at = cached_entry
+        if expire_at > now:
+            return data
 
-    db = await get_db()
     row = await db.fetchrow(
         "SELECT id, name, rtsp_url, enabled FROM cameras WHERE id=$1", cam_id,
     )
     if row:
-        _camera_cache[cam_id] = dict(row)
-        _cache_ttl = now + _CACHE_TTL_SEC
-        return _camera_cache[cam_id]
+        _camera_cache[cam_id] = (dict(row), now + _CACHE_TTL_SEC)
+        return _camera_cache[cam_id][0]
     return None
 
 
-class StreamSession:
-    """Quản lý 1 session stream FFmpeg → WebSocket."""
-
-    def __init__(self, cam_id: int, rtsp_url: str):
-        self.cam_id = cam_id
-        self.rtsp_url = rtsp_url
-        self.process: Optional[subprocess.Popen] = None
-        self.ws_clients: set[WebSocket] = set()
-        self._task: Optional[asyncio.Task] = None
-        self._running = False
-
-    async def start(self, ws: WebSocket):
-        """Bắt đầu FFmpeg process và stream video."""
-        await ws.accept()
-        self.ws_clients.add(ws)
-        self._running = True
-
-        # FFmpeg: RTSP → MPEG-TS (jsmpeg compatible)
-        # -re: read at native framerate
-        # -c copy: copy codec (fast, no re-encode)
-        # -f mpegts: output format MPEG-TS
-        cmd = (
-            f"ffmpeg -rtsp_transport tcp -re -i {shlex.quote(self.rtsp_url)} "
-            f"-c copy -f mpegts - "
-        )
-
-        logger.info(f"[cam={self.cam_id}] Starting FFmpeg: {cmd}")
-
-        try:
-            self.process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                shell=True,
-            )
-        except Exception as e:
-            logger.error(f"[cam={self.cam_id}] FFmpeg start failed: {e}")
-            await ws.close(code=1011, reason=f"FFmpeg failed: {e}")
-            return
-
-        self._task = asyncio.create_task(self._stream_loop())
-
-    async def _stream_loop(self):
-        """Đọc frame từ FFmpeg stdout và gửi qua WebSocket."""
-        loop = asyncio.get_event_loop()
-        BUF_SIZE = 8192
-
-        try:
-            while self._running and self.process and self.process.poll() is None:
-                try:
-                    data = await asyncio.wait_for(
-                        loop.run_in_executor(None, self.process.stdout.read, BUF_SIZE),
-                        timeout=5.0,
-                    )
-                except asyncio.TimeoutError:
-                    continue
-
-                if not data:
-                    await asyncio.sleep(0.1)
-                    continue
-
-                dead = set()
-                for client in self.ws_clients:
-                    try:
-                        await client.send_bytes(data)
-                    except Exception:
-                        dead.add(client)
-
-                for client in dead:
-                    self.ws_clients.discard(client)
-
-        except asyncio.CancelledError:
-            pass
-        finally:
-            self._cleanup()
-
-    def _cleanup(self):
-        self._running = False
-        if self.process:
-            try:
-                self.process.terminate()
-                self.process.wait(timeout=3)
-            except Exception:
-                self.process.kill()
-            self.process = None
-
-    async def stop(self, ws: WebSocket):
-        self.ws_clients.discard(ws)
-        if not self.ws_clients:
-            self._cleanup()
-
-
-# Global registry: camera_id → StreamSession
-_active_streams: dict[int, StreamSession] = {}
-
-
-@router.websocket("/ws/stream/{cam_id}")
-async def ws_video_stream(cam_id: int, websocket: WebSocket):
+def _build_stream_urls(source_id: str) -> dict:
     """
-    WebSocket endpoint streaming video.
-    Browser kết nối: ws://host/ws/stream/{camera_id}
-    Sau đó khởi tạo jsmpeg player: new JSMpeg.Player(url)
+    Trả về các URL stream của go2rtc cho source_id đó.
+    Browser có thể dùng WebRTC, HLS hoặc MSE tuỳ player.
     """
-    # Validate camera tồn tại
-    cam = await _get_cached_camera(cam_id)
-    if not cam:
-        await websocket.close(code=1008, reason=f"Camera {cam_id} not found")
-        return
-    if not cam.get("enabled"):
-        await websocket.close(code=1008, reason=f"Camera {cam_id} is disabled")
-        return
-
-    rtsp_url = cam.get("rtsp_url")
-    if not rtsp_url or not rtsp_url.startswith("rtsp://"):
-        await websocket.close(code=1008, reason=f"Camera {cam_id} has invalid RTSP URL")
-        return
-
-    # Dùng chung session cho tất cả client cùng camera
-    if cam_id not in _active_streams:
-        _active_streams[cam_id] = StreamSession(cam_id, rtsp_url)
-        asyncio.create_task(_active_streams[cam_id].start(websocket))
-    else:
-        session = _active_streams[cam_id]
-        if not session._running:
-            # Restart stream mới
-            asyncio.create_task(session.start(websocket))
-        else:
-            session.ws_clients.add(websocket)
-            await websocket.accept()
-
-    try:
-        while True:
-            # Chờ client disconnect signal
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        session = _active_streams.get(cam_id)
-        if session:
-            await session.stop(websocket)
-            if not session.ws_clients and session._running:
-                session._cleanup()
-                del _active_streams[cam_id]
-    except Exception as e:
-        logger.error(f"[cam={cam_id}] Stream error: {e}")
-        session = _active_streams.get(cam_id)
-        if session:
-            await session.stop(websocket)
-            if not session.ws_clients:
-                session._cleanup()
-                del _active_streams[cam_id]
-
-
-@router.get("/stream/{cam_id}/status")
-async def stream_status(cam_id: int, _=Depends(require_jwt)):
-    """Trả về trạng thái stream của camera."""
-    session = _active_streams.get(cam_id)
     return {
-        "camera_id": cam_id,
-        "streaming": session is not None and session._running,
-        "clients": len(session.ws_clients) if session else 0,
-        "ffmpeg_running": session.process is not None and session.process.poll() is None if session else False,
+        # WebRTC: độ trễ thấp nhất (~200ms)
+        "webrtc":     f"{GO2RTC_URL}/webrtc?src={source_id}",
+        # HLS: tương thích rộng nhất (Safari, iOS)
+        "hls":        f"{GO2RTC_URL}/stream.m3u8?src={source_id}",
+        # MSE (Media Source Extensions): Chrome/Firefox, latency thấp hơn HLS
+        "mse":        f"{GO2RTC_URL}/stream.mp4?src={source_id}",
+        # RTSP re-stream: cho các client RTSP khác (VLC, Savant)
+        "rtsp":       f"{GO2RTC_RTSP_URL}/{source_id}",
+        # go2rtc player UI
+        "player_ui":  f"{GO2RTC_URL}/?src={source_id}",
     }
 
 
-@router.get("/stream/active")
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@router.get("/api/stream/{cam_id}/info", summary="Stream URLs của camera")
+async def stream_info(cam_id: int, db=Depends(get_db), _=Depends(require_jwt)):
+    """
+    Trả về các URL stream go2rtc cho camera.
+    Frontend dùng URL này để kết nối WebRTC/HLS trực tiếp — không qua backend.
+    """
+    cam = await _get_cached_camera(cam_id, db)
+    if not cam:
+        raise HTTPException(status_code=404, detail=f"Camera {cam_id} không tồn tại")
+    if not cam.get("enabled"):
+        raise HTTPException(status_code=400, detail=f"Camera {cam_id} đang bị tắt")
+
+    source_id = cam.get("name") or f"cam_{cam_id}"
+    return {
+        "camera_id": cam_id,
+        "source_id": source_id,
+        "urls":      _build_stream_urls(source_id),
+    }
+
+
+@router.get("/api/stream/{cam_id}/status", summary="Trạng thái stream")
+async def stream_status(cam_id: int, db=Depends(get_db), _=Depends(require_jwt)):
+    """Trả về trạng thái stream của camera từ go2rtc API."""
+    cam = await _get_cached_camera(cam_id, db)
+    if not cam:
+        raise HTTPException(status_code=404, detail=f"Camera {cam_id} không tồn tại")
+
+    source_id = cam.get("name") or f"cam_{cam_id}"
+
+    try:
+        resp = await _go2rtc_client.get("/api/streams")
+        resp.raise_for_status()
+        streams: dict = resp.json() or {}
+        stream_data = streams.get(source_id)
+        is_active = stream_data is not None
+        producers = stream_data.get("producers", []) if stream_data else []
+        consumers = stream_data.get("consumers", []) if stream_data else []
+    except Exception as exc:
+        logger.warning("Cannot reach go2rtc API: %s", exc)
+        is_active = False
+        producers = []
+        consumers = []
+
+    return {
+        "camera_id":   cam_id,
+        "source_id":   source_id,
+        "active":      is_active,
+        "producers":   len(producers),   # Nguồn input (RTSP camera)
+        "consumers":   len(consumers),   # Số client đang xem
+        "urls":        _build_stream_urls(source_id) if is_active else {},
+    }
+
+
+@router.get("/api/stream/active", summary="Danh sách streams đang active")
 async def list_active_streams(_=Depends(require_jwt)):
-    """Liệt kê các camera đang stream."""
-    return [
-        {
-            "camera_id": cam_id,
-            "clients": len(s.ws_clients),
-            "running": s._running,
-        }
-        for cam_id, s in _active_streams.items()
-    ]
+    """Liệt kê tất cả streams đang active trên go2rtc."""
+    try:
+        resp = await _go2rtc_client.get("/api/streams")
+        resp.raise_for_status()
+        streams: dict = resp.json() or {}
+    except Exception as exc:
+        logger.warning("Cannot reach go2rtc API: %s", exc)
+        return {"error": "go2rtc unavailable", "streams": []}
+
+    return {
+        "total": len(streams),
+        "streams": [
+            {
+                "source_id": name,
+                "producers": len(data.get("producers", [])),
+                "consumers": len(data.get("consumers", [])),
+                "urls":      _build_stream_urls(name),
+            }
+            for name, data in streams.items()
+        ],
+    }

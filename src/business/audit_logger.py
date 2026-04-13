@@ -54,6 +54,7 @@ class AuditLogger:
     def __init__(self):
         self._db_dsn: str | None = None
         self._audit_base: str    = _AUDIT_BASE
+        self._db_pool            = None   # psycopg2 ThreadedConnectionPool
 
         self._queue: queue.Queue = queue.Queue(maxsize=_QUEUE_MAXSIZE)
         self._worker: threading.Thread | None = None
@@ -67,6 +68,15 @@ class AuditLogger:
         self._db_dsn      = db_dsn
         self._audit_base  = audit_base or _AUDIT_BASE
         os.makedirs(self._audit_base, exist_ok=True)
+
+        if db_dsn:
+            try:
+                import psycopg2.pool
+                self._db_pool = psycopg2.pool.ThreadedConnectionPool(1, 4, db_dsn)
+                logger.info("AuditLogger DB pool created (min=1, max=4).")
+            except Exception as exc:
+                logger.warning("AuditLogger DB pool init failed: %s — DB writes disabled.", exc)
+                self._db_pool = None
 
         self._worker = threading.Thread(
             target=self._write_loop,
@@ -206,6 +216,13 @@ class AuditLogger:
 
         logger.debug("Audit written: %s", json_path)
 
+        # Thông báo cho watchdog biết pipeline đang hoạt động
+        try:
+            from src.watchdog.pipeline_watchdog import pipeline_watchdog
+            pipeline_watchdog.notify_json_activity(camera_id=payload.get("camera_id", "global"))
+        except Exception:
+            pass
+
     def _write_linked(self, linked_event: Any) -> None:
         """
         Ghi LinkedEvent ra disk và DB.
@@ -246,14 +263,23 @@ class AuditLogger:
 
         logger.debug("Linked audit written: %s", json_path)
 
+        # Thông báo cho watchdog
+        try:
+            from src.watchdog.pipeline_watchdog import pipeline_watchdog
+            pipeline_watchdog.notify_json_activity(camera_id=source_id)
+        except Exception:
+            pass
+
     def _db_insert_access_event(self, payload: dict, json_path: str) -> None:
         """
         Ghi tóm tắt event vào bảng access_events trong PostgreSQL.
-        Chỉ lưu các trường cốt lõi — ảnh và chi tiêt đầy đủ nằm trong file JSON.
+        Dùng connection pool để tránh tạo TCP connection mới mỗi event.
         """
+        if not self._db_pool:
+            return
+        conn = None
         try:
-            import psycopg2
-            conn = psycopg2.connect(self._db_dsn)
+            conn = self._db_pool.getconn()
             cur  = conn.cursor()
             cur.execute(
                 """
@@ -277,9 +303,16 @@ class AuditLogger:
             )
             conn.commit()
             cur.close()
-            conn.close()
         except Exception as exc:
             logger.debug("DB access_events insert error: %s", exc)
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+        finally:
+            if conn:
+                self._db_pool.putconn(conn)
 
 
 # ── Singleton instance ────────────────────────────────────────────────────────

@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/unit/ingress/test_go2rtc_sync.py -v --tb=short)",
+      "Bash(pip install:*)",
+      "Bash(python -c \"import psycopg2; print\\(psycopg2.__file__\\)\")",
+      "Bash(python -c \"import sys; sys.path.insert\\(0, '.'\\); import psycopg2; print\\(psycopg2.__file__\\)\")",
+      "Bash(python -m pytest tests/unit/ingress/test_go2rtc_sync.py::TestFetchCameras::test_returns_camera_rows_on_success -v --tb=long)",
+      "Bash(python -c ':*)",
+      "Bash(python -m pytest tests/unit/ingress/test_go2rtc_sync.py::TestFetchCameras::test_returns_empty_list_on_db_error -v -s)",
+      "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(python -m pytest --version)",
+      "Bash(python -c \"import psycopg2.extensions; print\\('extensions OK'\\)\")",
+      "Bash(cat tests/conftest.py)",
+      "Bash(ls tests/unit/)",
+      "Bash(python -m pytest tests/unit/ -v --tb=short)"
+    ]
+  }
+}

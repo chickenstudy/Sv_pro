@@ -60,35 +60,44 @@ Tiến trình `savant-roi-eval` chạy cron **23:50** hàng ngày: phân tích 3
 ## 📐 Kiến trúc tổng quan
 
 ```
-RTSP Camera (192.168.x.xxx)
-    │  cam_gate_1 (15 FPS)           cam_parking_1 (10 FPS)
-    │       │                               │
-    ▼       ▼                               ▼
-[savant-video-ingress-1]        [savant-video-ingress-2]
-        │                                   │
-        └──────────────┬────────────────────┘
-                       │ ZMQ req/rep  (input-video.ipc)
-                       ▼
-          ┌────────────────────────────┐
-          │   savant-ai-core (GPU)     │
-          │   DeepStream 7.x Pipeline  │
-          │                            │
-          │  [Stage 1 — nvinfer]       │
-          │  YOLOv8s TensorRT FP16     │
-          │  Detect: Vehicle / Person  │
-          │                            │
-          │  [Stage 2 — PyFunc]        │
-          │  ┌──────────┬────────────┐ │
-          │  │ PlateOCR │FaceRecog.  │ │
-          │  └──────────┴────────────┘ │
-          └────────────────────────────┘
-                       │ ZMQ pub/sub  (output-video.ipc)
-                       ▼
-   ┌───────────────────┼──────────────────────┐
-   ▼                   ▼                      ▼
-[json-egress]    [video-egress-1]    [video-egress-2]
-JSON → /output   RTSP Annot → :554   HLS → :888
-Kafka / ES
+Camera RTSP (IP: 192.168.x.xxx)
+       │  cam_gate_1 (15 FPS)       cam_parking_1 (10 FPS)
+       │       │                           │
+       ▼       ▼                           ▼
+            ┌────────────────────────────────┐
+            │   go2rtc (RTSP Broker)         │
+            │   Port 1984: HTTP API + WebUI  │ ← go2rtc_sync.py
+            │   Port 8554: RTSP re-stream    │   (PG NOTIFY → REST API)
+            │   Port 8555: WebRTC (browser)  │
+            └────────────────────────────────┘
+                    │ rtsp://go2rtc:8554/{cam_id}
+                    ▼
+            ┌────────────────────────────────┐
+            │  savant-rtsp-ingress           │
+            │  cv2.VideoCapture per camera   │
+            │  Frames → ZMQ PUB             │
+            └────────────────────────────────┘
+                    │ ZMQ IPC (input-video.ipc)
+                    ▼
+            ┌────────────────────────────────┐
+            │   savant-ai-core (GPU)         │
+            │   DeepStream 7.x Pipeline      │
+            │                                │
+            │   [Stage 1 — nvinfer]          │
+            │   YOLOv8s TensorRT FP16        │
+            │   Detect: Vehicle / Person     │
+            │                                │
+            │   [Stage 2a — PyFunc] PlateOCR │
+            │   [Stage 2b — PyFunc] FaceRecog│
+            │                                │
+            │   [Stage 3 — PyFunc]           │
+            │   BlacklistPyfunc              │
+            └────────────────────────────────┘
+                    │
+           ┌────────┴────────┐
+           ▼                 ▼
+     [alert_manager]   [audit_logger]
+     Telegram/Webhook  PostgreSQL (events)
 ```
 
 > Chi tiết đầy đủ: [`docs/Architecture.md`](docs/Architecture.md)
@@ -101,6 +110,9 @@ Kafka / ES
 |------|-----------|---------|
 | GPU Inference | NVIDIA DeepStream 7.x + TensorRT FP16 | Decode H.264/H.265 NVDEC + chạy model AI trên GPU |
 | AI Framework | Savant (insight-platform) | Pipeline manager, ZMQ IPC, PyFunc plugin system |
+| RTSP Broker | **go2rtc** | Nhận RTSP từ IP camera, re-stream cho Savant Ingress + WebRTC browser |
+| Camera Sync | go2rtc_sync.py + PG NOTIFY | Đồng bộ camera DB → go2rtc REST API realtime |
+| RTSP Ingress | rtsp_ingest.py (savant-rtsp-ingress) | Pull RTSP từ go2rtc → push ZMQ frames vào Savant AI Core |
 | Person/Vehicle Det. | YOLOv8s (TensorRT) | Tầng 1: phát hiện người & xe trên full frame |
 | Face Detection | SCRFD-10GF (ONNX Runtime) | 5-point landmark, face alignment trước ArcFace |
 | Face Embedding | ArcFace R100 (InsightFace ONNX) | 512-dim Float32 vector, L2-normalized |
@@ -109,9 +121,11 @@ Kafka / ES
 | Anti-Spoofing | MiniFASNet (ONNX) | Liveness detection ~3ms/face |
 | Vector DB | PostgreSQL 16 + pgvector (HNSW) | Lưu & tìm kiếm cosine similarity hàng triệu face |
 | Cache | Redis 7 | Hot-cache embedding nhân viên, giảm I/O DB |
-| Message Bus | ZeroMQ (IPC Unix socket) | Zero-copy transport giữa Ingress / Core / Egress |
+| Alert | AlertManager | Gửi cảnh báo Telegram + Webhook khi phát hiện xâm phạm |
+| Message Bus | ZeroMQ (IPC Unix socket) | Zero-copy transport giữa Ingress / Core |
 | Monitoring | Prometheus + Grafana | FPS, GPU%, VRAM, queue depth, recognition rate |
-| API Backend | FastAPI (Python) | REST/gRPC endpoint nhận vector từ AI Core, query pgvector |
+| API Backend | FastAPI (Python) | REST endpoint CRUD camera/user/event, stream proxy URL |
+| Frontend | React SPA (Nginx) | Dashboard giám sát và quản lý |
 | Container | Docker + Docker Compose V2 | Orchestration toàn bộ stack |
 
 ---
@@ -169,14 +183,17 @@ python scripts/download_models.py
 ### Bước 3 — Khởi động stack
 
 ```bash
-# Khởi động toàn bộ (Postgres + pgvector, Redis, AI pipeline, API backend, Grafana)
+# Khởi động toàn bộ (Postgres + pgvector, Redis, go2rtc, AI pipeline, API backend, Grafana)
 docker compose up -d --build
 
 # Theo dõi log AI pipeline
 docker compose logs -f savant-ai-core
 
-# Theo dõi JSON metadata output
-docker compose logs -f savant-json-egress
+# Theo dõi RTSP ingress (camera connections)
+docker compose logs -f savant-rtsp-ingress
+
+# Theo dõi go2rtc stream sync
+docker compose logs -f go2rtc-sync
 
 # Dừng hoàn toàn
 docker compose down
@@ -185,11 +202,9 @@ docker compose down
 ### Bước 4 — Khởi tạo database
 
 ```bash
-# Chạy migration schema (tạo tables + HNSW index)
-docker compose exec sv-api-backend python scripts/init_db.py
-
-# Kiểm tra pgvector index
-docker compose exec postgres psql -U svpro -c "\d users"
+# DB migration được chạy tự động khi startup qua db-init service.
+# Kiểm tra sau khi containers ready:
+docker compose exec postgres psql -U svpro_user -d svpro_db -c "\dt"
 ```
 
 ---

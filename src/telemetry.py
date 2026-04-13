@@ -43,7 +43,6 @@ class DropReason:
     QUEUE_FULL         = "queue_full"
     SEND_TIMEOUT       = "send_timeout"
     SUBSCRIBER_LAG     = "subscriber_lag"
-    EOS_STORM_GUARDED  = "eos_storm_guarded"
     SOCKET_STATE_ERROR = "socket_state_error"
     DISK_FULL          = "disk_full"
     WRITER_QUEUE_FULL  = "writer_queue_full"
@@ -223,36 +222,6 @@ class SvProMetrics:
         self.alerts_throttled_total = Counter(
             f"{_NS}_alerts_throttled_total",
             "Số alerts bị throttle do rate limit",
-            ["camera_id"],
-            registry=reg,
-        )
-
-        # ── EOS Storm ─────────────────────────────────────────────────────────
-        self.eos_storm_detected = Counter(
-            f"{_NS}_eos_storm_detected_total",
-            "Số lần EOS storm được phát hiện và guard",
-            ["camera_id"],
-            registry=reg,
-        )
-
-        # ── EOS Events (mới cho seq_id debugging) ────────────────────────────────
-        self.eos_received_total = Counter(
-            f"{_NS}_eos_received_total",
-            "Tổng số EOS events nhận được từ RTSP",
-            ["camera_id"],
-            registry=reg,
-        )
-
-        self.eos_forwarded_total = Counter(
-            f"{_NS}_eos_forwarded_total",
-            "Tổng số EOS được forward vào ZMQ (không bị guard drop)",
-            ["camera_id"],
-            registry=reg,
-        )
-
-        self.eos_dropped_total = Counter(
-            f"{_NS}_eos_dropped_total",
-            "Tổng số EOS bị guard drop trong EOS storm",
             ["camera_id"],
             registry=reg,
         )

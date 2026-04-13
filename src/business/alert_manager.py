@@ -1,5 +1,5 @@
 """
-Alert Manager cho SV-PRO — Sprint 4.
+Alert Manager cho SV-PRO — Sprint 4 (Refactored Sprint 5).
 
 Xử lý gửi cảnh báo đến Telegram và Webhook khi nhận BlacklistEvent từ BlacklistEngine.
 
@@ -7,31 +7,28 @@ Tính năng:
   - Rate limiting: chặn spam (1 alert / entity / 5 phút theo cấu hình).
   - Gửi ảnh kèm theo qua Telegram sendPhoto nếu có crop.
   - Gửi POST JSON tới danh sách Webhook URLs.
-  - Message template hỗ trợ format string với {placeholder}.
   - Background queue: không block pipeline hot path khi gửi.
   - Retry tối đa 3 lần với exponential backoff khi timeout.
+  - Dùng httpx thay urllib thô — gọn, đúng chuẩn, dễ test.
 """
 
-import json
 import logging
 import queue
 import threading
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
-from dataclasses import asdict
-from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-import cv2
+import httpx
 import numpy as np
+import cv2
 
 from .blacklist_engine import BlacklistEvent, Severity
 
 logger = logging.getLogger(__name__)
 
 # ── Timezone Việt Nam ───────────────────────────────────────────────────────────
+# (dùng trong build_telegram_text)
+from datetime import timezone, timedelta
 _VN_TZ = timezone(timedelta(hours=7))
 
 # ── Rate limit mặc định ────────────────────────────────────────────────────────
@@ -44,6 +41,10 @@ _RETRY_BASE_DELAY = 1.0        # Giây, nhân đôi mỗi lần retry
 
 # ── Queue size ─────────────────────────────────────────────────────────────────
 _QUEUE_MAXSIZE = 500
+
+# ── HTTP timeout (giây) ────────────────────────────────────────────────────────
+_TELEGRAM_TIMEOUT = 10.0
+_WEBHOOK_TIMEOUT  = 5.0
 
 
 class AlertManager:
@@ -58,10 +59,8 @@ class AlertManager:
         self._telegram_token: str | None = None
         self._telegram_chat_id: str | None = None
         self._telegram_send_photo: bool = True
-        self._telegram_timeout: float = 5.0
 
         self._webhook_urls: list[str] = []
-        self._webhook_timeout: float = 3.0
         self._webhook_headers: dict[str, str] = {"Content-Type": "application/json"}
 
         self._rate_secs: float = _DEFAULT_RATE_SECS
@@ -79,14 +78,18 @@ class AlertManager:
         self._worker_thread: threading.Thread | None = None
         self._initialized = False
 
+        # httpx Client dùng chung trong background thread (không thread-safe nếu dùng từ nhiều thread)
+        # Worker thread là đơn luồng nên dùng 1 client là an toàn
+        self._http: httpx.Client | None = None
+
     def initialize(
         self,
         telegram_token: str | None = None,
         telegram_chat_id: str | None = None,
         telegram_send_photo: bool = True,
-        telegram_timeout: float = 5.0,
+        telegram_timeout: float = _TELEGRAM_TIMEOUT,
         webhook_urls: list[str] | None = None,
-        webhook_timeout: float = 3.0,
+        webhook_timeout: float = _WEBHOOK_TIMEOUT,
         webhook_headers: dict | None = None,
         rate_secs: float = _DEFAULT_RATE_SECS,
         global_rpm: int  = _DEFAULT_GLOBAL_RPM,
@@ -98,14 +101,23 @@ class AlertManager:
         self._telegram_token     = telegram_token
         self._telegram_chat_id   = telegram_chat_id
         self._telegram_send_photo = telegram_send_photo
-        self._telegram_timeout   = telegram_timeout
         self._webhook_urls       = webhook_urls or []
-        self._webhook_timeout    = webhook_timeout
         self._webhook_headers    = webhook_headers or {"Content-Type": "application/json"}
         self._rate_secs          = rate_secs
         self._global_rpm         = global_rpm
 
         self._minute_start = time.monotonic()
+
+        # Tạo httpx Client với timeout hợp lý
+        self._http = httpx.Client(
+            timeout=httpx.Timeout(
+                connect=5.0,
+                read=max(telegram_timeout, webhook_timeout),
+                write=max(telegram_timeout, webhook_timeout),
+                pool=5.0,
+            ),
+            follow_redirects=True,
+        )
 
         # Khởi động background worker
         self._worker_thread = threading.Thread(
@@ -134,7 +146,6 @@ class AlertManager:
             logger.warning("AlertManager chưa được initialize — bỏ qua alert.")
             return False
 
-        # Rate limit check
         if not self._check_rate(event):
             logger.debug(
                 "Alert bị throttle: entity=%s type=%s",
@@ -230,14 +241,11 @@ class AlertManager:
             self._send_webhook(url, event)
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Telegram
+    # Telegram — dùng httpx thay urllib
     # ──────────────────────────────────────────────────────────────────────────
 
     def _build_telegram_text(self, event: BlacklistEvent) -> str:
-        """
-        Dịch BlacklistEvent thành text Markdown cho Telegram.
-        Sử dụng template tương ứng với event_type.
-        """
+        """Dịch BlacklistEvent thành text Markdown cho Telegram."""
         severity_icon = {
             Severity.LOW:      "🟡",
             Severity.MEDIUM:   "🟠",
@@ -250,10 +258,10 @@ class AlertManager:
             "blacklist_vehicle":    f"{severity_icon} *Phát hiện xe trong danh sách chú ý!*",
             "zone_denied":          f"{severity_icon} *Truy cập trái phép vào khu vực hạn chế!*",
             "time_denied":          f"{severity_icon} *Truy cập ngoài giờ quy định!*",
-            "spoof_detected":       f"🔴 *Phát hiện giả mạo khuôn mặt!*",
-            "stranger_restricted":  f"⚠️ *Người lạ trong khu vực hạn chế*",
+            "spoof_detected":       "🔴 *Phát hiện giả mạo khuôn mặt!*",
+            "stranger_restricted":  "⚠️ *Người lạ trong khu vực hạn chế*",
         }
-        header = event_labels.get(event.event_type, f"⚠️ *Cảnh báo SV-PRO*")
+        header = event_labels.get(event.event_type, "⚠️ *Cảnh báo SV-PRO*")
 
         lines = [
             header,
@@ -277,22 +285,28 @@ class AlertManager:
 
     def _send_telegram(self, event: BlacklistEvent, img_bytes: bytes | None) -> None:
         """
-        Gửi cảnh báo qua Telegram API.
-        Nếu có ảnh và cấu hình send_photo=True → dùng sendPhoto, ngược lại sendMessage.
-        Retry tối đa _MAX_RETRIES lần với backoff tăng dần.
+        Gửi cảnh báo qua Telegram API dùng httpx.
+        Tự động chọn sendPhoto (nếu có ảnh) hoặc sendMessage.
+        Retry tối đa _MAX_RETRIES lần với exponential backoff.
         """
-        text = self._build_telegram_text(event)
         base_url = f"https://api.telegram.org/bot{self._telegram_token}"
-
+        text = self._build_telegram_text(event)
         use_photo = self._telegram_send_photo and img_bytes is not None
 
         for attempt in range(_MAX_RETRIES):
             try:
                 if use_photo:
-                    self._tg_send_photo(base_url, text, img_bytes)
+                    self._http.post(
+                        f"{base_url}/sendPhoto",
+                        data={"chat_id": self._telegram_chat_id, "caption": text, "parse_mode": "Markdown"},
+                        files={"photo": ("alert.jpg", img_bytes, "image/jpeg")},
+                    ).raise_for_status()
                 else:
-                    self._tg_send_message(base_url, text)
-                return   # Thành công
+                    self._http.post(
+                        f"{base_url}/sendMessage",
+                        json={"chat_id": self._telegram_chat_id, "text": text, "parse_mode": "Markdown"},
+                    ).raise_for_status()
+                return  # Thành công
             except Exception as exc:
                 wait = _RETRY_BASE_DELAY * (2 ** attempt)
                 logger.warning(
@@ -303,53 +317,14 @@ class AlertManager:
 
         logger.error("Telegram send FAILED after %d attempts for event %s", _MAX_RETRIES, event.event_type)
 
-    def _tg_send_message(self, base_url: str, text: str) -> None:
-        """Gửi text message tới Telegram chat_id."""
-        url  = f"{base_url}/sendMessage"
-        data = json.dumps({
-            "chat_id":    self._telegram_chat_id,
-            "text":       text,
-            "parse_mode": "Markdown",
-        }).encode("utf-8")
-        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=self._telegram_timeout):
-            pass
-
-    def _tg_send_photo(self, base_url: str, caption: str, img_bytes: bytes) -> None:
-        """Gửi ảnh kèm caption tới Telegram chat_id (multipart/form-data)."""
-        import io
-        url = f"{base_url}/sendPhoto"
-        boundary = "----AlertBoundary"
-
-        body_parts = []
-        body_parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{self._telegram_chat_id}\r\n".encode())
-        body_parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{caption}\r\n".encode())
-        body_parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"parse_mode\"\r\n\r\nMarkdown\r\n".encode())
-        body_parts.append(
-            f"--{boundary}\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"alert.jpg\"\r\n"
-            f"Content-Type: image/jpeg\r\n\r\n".encode()
-            + img_bytes
-            + b"\r\n"
-        )
-        body_parts.append(f"--{boundary}--\r\n".encode())
-        body = b"".join(body_parts)
-
-        req = urllib.request.Request(
-            url, data=body,
-            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-        )
-        with urllib.request.urlopen(req, timeout=self._telegram_timeout):
-            pass
-
     # ──────────────────────────────────────────────────────────────────────────
-    # Webhook
+    # Webhook — dùng httpx thay urllib
     # ──────────────────────────────────────────────────────────────────────────
 
     def _send_webhook(self, url: str, event: BlacklistEvent) -> None:
         """
-        Gửi POST request JSON tới webhook URL.
-        Payload chứa toàn bộ thông tin event (không bao gồm ảnh binary).
-        Retry tối đa _MAX_RETRIES lần.
+        Gửi POST JSON tới webhook URL dùng httpx.
+        Retry tối đa _MAX_RETRIES lần với exponential backoff.
         """
         payload = {
             "event_type":  event.event_type,
@@ -363,13 +338,11 @@ class AlertManager:
             "timestamp":   event.timestamp,
             "extra":       event.extra,
         }
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
         for attempt in range(_MAX_RETRIES):
             try:
-                req = urllib.request.Request(url, data=data, headers=self._webhook_headers)
-                with urllib.request.urlopen(req, timeout=self._webhook_timeout):
-                    return   # Thành công
+                self._http.post(url, json=payload, headers=self._webhook_headers).raise_for_status()
+                return  # Thành công
             except Exception as exc:
                 wait = _RETRY_BASE_DELAY * (2 ** attempt)
                 logger.warning("Webhook %s attempt %d/%d failed: %s", url, attempt + 1, _MAX_RETRIES, exc)

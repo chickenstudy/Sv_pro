@@ -55,6 +55,21 @@ if "psycopg2" not in sys.modules:
     _psycopg2_mod.connect = MagicMock()  # type: ignore[attr-defined]
     sys.modules["psycopg2"] = _psycopg2_mod
 
+# psycopg2.extensions — cần cho go2rtc_sync.py và rtsp_ingest.py
+if "psycopg2.extensions" not in sys.modules:
+    _psycopg2_ext = _make_mock_module("psycopg2.extensions")
+    _psycopg2_ext.ISOLATION_LEVEL_AUTOCOMMIT = 0  # type: ignore[attr-defined]
+    sys.modules["psycopg2.extensions"] = _psycopg2_ext
+    # Gắn vào package cha để `import psycopg2.extensions` hoạt động
+    sys.modules["psycopg2"].extensions = _psycopg2_ext  # type: ignore[attr-defined]
+
+# psycopg2.pool — cần cho BlacklistEngine và AuditLogger (ThreadedConnectionPool)
+if "psycopg2.pool" not in sys.modules:
+    _psycopg2_pool = _make_mock_module("psycopg2.pool")
+    _psycopg2_pool.ThreadedConnectionPool = MagicMock  # type: ignore[attr-defined]
+    sys.modules["psycopg2.pool"] = _psycopg2_pool
+    sys.modules["psycopg2"].pool = _psycopg2_pool  # type: ignore[attr-defined]
+
 # ─── Stub out redis ───────────────────────────────────────────────────────────
 if "redis" not in sys.modules:
     _redis_mod = _make_mock_module("redis")

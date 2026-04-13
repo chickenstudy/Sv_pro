@@ -1,33 +1,87 @@
 services:
-  # ── Ingress Manager: Dynamic RTSP từ DB ──
-  ingress-manager:
+  # ── go2rtc: RTSP Broker trung tâm (thay thế ingress-manager + video-egress) ──
+  go2rtc:
+    image: alexxit/go2rtc:latest
+    container_name: svpro_go2rtc
+    restart: unless-stopped
+    ports:
+      - "1984:1984" # HTTP API + WebUI
+      - "8554:8554" # RTSP re-stream (cho Savant AI Core)
+      - "8555:8555" # WebRTC
+    volumes:
+      - ./config/go2rtc.yaml:/config/go2rtc.yaml:ro
+    networks:
+      - svpro-net
+    healthcheck:
+      test:
+        ["CMD-SHELL", "wget -qO- http://localhost:1984/api/streams || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ── go2rtc-sync: Sync cameras DB → go2rtc (đăng ký RTSP URL vào go2rtc REST API) ──
+  # Chức năng: Lắng nghe PG NOTIFY cameras_changed → cập nhật go2rtc streams ngay lập tức.
+  # go2rtc tự kết nối tới IP camera và expose RTSP re-stream tại :8554/{source_id}.
+  go2rtc-sync:
     build:
       context: .
-      dockerfile: Dockerfile.ingress-manager
+      dockerfile: Dockerfile.backend # Tái dùng Python base của backend, chỉ đổi command
     restart: unless-stopped
     entrypoint: python
-    command: [ "/opt/savant/user_data/src/ingress/ingress_manager.py" ]
+    command: ["-m", "src.ingress.go2rtc_sync"]
     depends_on:
       postgres:
         condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+      go2rtc:
+        condition: service_healthy
+    volumes:
+      - .:/opt/savant/user_data
+    networks:
+      - svpro-net
+    environment:
+      - PYTHONPATH=/opt/savant/user_data
+      - POSTGRES_DSN=postgresql://${POSTGRES_USER:-svpro_user}:${POSTGRES_PASSWORD:-svpro_pass}@postgres:5432/${POSTGRES_DB:-svpro_db}
+      - GO2RTC_URL=http://go2rtc:1984
+      - POLL_INTERVAL_SECS=30
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f go2rtc_sync || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── savant-rtsp-ingress: RTSP Pull từ go2rtc → ZMQ Push vào Savant AI Core ──
+  # Chức năng: Đọc frame RTSP từ go2rtc:8554/{source_id} cho từng camera active.
+  #            Encode frame → push vào input-video.ipc cho savant-ai-core (ZMQ SUB).
+  # Lắng nghe PG NOTIFY để tự động thêm/xóa camera stream khi DB thay đổi.
+  savant-rtsp-ingress:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    restart: unless-stopped
+    entrypoint: python
+    command: ["-m", "src.ingress.rtsp_ingest"]
+    depends_on:
+      go2rtc-sync:
+        condition: service_healthy
+      savant-ai-core:
+        condition: service_started
     volumes:
       - .:/opt/savant/user_data
       - zmq-sockets:/tmp/zmq-sockets
     networks:
       - svpro-net
     environment:
-      - PYTHONPATH=/opt/savant:/opt/savant/user_data
+      - PYTHONPATH=/opt/savant/user_data
+      - GO2RTC_URL=http://go2rtc:1984
+      - GO2RTC_RTSP_BASE=rtsp://go2rtc:8554
+      - ZMQ_PUB_ENDPOINT=pub+connect:ipc:///tmp/zmq-sockets/input-video.ipc
       - POSTGRES_DSN=postgresql://${POSTGRES_USER:-svpro_user}:${POSTGRES_PASSWORD:-svpro_pass}@postgres:5432/${POSTGRES_DB:-svpro_db}
-      - ZMQ_ENDPOINT=pub+connect:ipc:///tmp/zmq-sockets/input-video.ipc
-      - POLL_INTERVAL_SECS=10
-      - ZMQ_SNDHWM=100
-      - ZMQ_SNDTIMEO=200
-      - ZMQ_LINGER=0
-      - EOS_THRESHOLD=5
-      - EOS_WINDOW_SECS=1.0
-      - GST_PLUGIN_PATH=/opt/savant/adapters/gst/gst_plugins
+      - POLL_INTERVAL_SECS=30
+      - TARGET_FPS=10
     healthcheck:
-      test: [ "CMD-SHELL", "pgrep -f ingress_manager || exit 1" ]
+      test: ["CMD-SHELL", "pgrep -f rtsp_ingest || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -38,14 +92,20 @@ services:
       context: .
       dockerfile: Dockerfile.savant-ai-core
     runtime: nvidia
+    # restart: unless-stopped là chính sách restart mặc định.
+    # Docker Compose sẽ tự restart khi container exit bất kẻ lý do gì (OOM, crash, healthcheck fail).
+    # Không cần watchdog tự gọi `docker compose restart` nữa.
     restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
       db-init:
         condition: service_completed_successfully
+      go2rtc-sync:
+        condition: service_healthy # Đảm bảo go2rtc đã có RTSP streams trước khi AI Core start
     ports:
       - "9080:8080" # 9080 trên host → tránh trùng với VMS API (8080)
+      # 8090 không expose ra host — chỉ dành cho backend gọi nội bộ qua Docker network
     volumes:
       - .:/opt/savant/user_data
       - zmq-sockets:/tmp/zmq-sockets
@@ -54,14 +114,20 @@ services:
     environment:
       - PYTHONPATH=/opt/savant:/opt/savant/user_data
       - MODEL_PATH=/models
-      # ZMQ Input & Output
+      # ZMQ — AI Core nhận frames từ savant-rtsp-ingress qua ZMQ IPC:
+      #   Input : SUB socket — nhận JPEG frames từ rtsp_ingest.py
+      #   Output: PUB socket — phát metadata event cho subscriber (reserved)
       - ZMQ_SRC_ENDPOINT=sub+bind:ipc:///tmp/zmq-sockets/input-video.ipc
       - ZMQ_SINK_ENDPOINT=pub+bind:ipc:///tmp/zmq-sockets/output-video.ipc
-      # ZMQ HWM (Task 1.6)
+      # ZMQ HWM — giới hạn buffer, tránh dead-lock khi pipeline stall
       - ZMQ_SNDHWM=100
       - ZMQ_RCVHWM=100
       # Database credentials — dùng env thay vì hardcode trong module.yml
       - POSTGRES_DSN=postgresql://${POSTGRES_USER:-svpro_user}:${POSTGRES_PASSWORD:-svpro_pass}@postgres:5432/${POSTGRES_DB:-svpro_db}
+      # go2rtc RTSP base — savant-rtsp-ingress pull từ đây, truyền vào AI Core qua ZMQ
+      - GO2RTC_RTSP_BASE=rtsp://go2rtc:8554
+      # Port cho Enrollment HTTP Service (chạy trong thread riêng của AI Core)
+      - ENROLLMENT_PORT=8090
     command: /opt/savant/user_data/module/module.yml
     deploy:
       resources:
@@ -69,61 +135,21 @@ services:
           devices:
             - driver: nvidia
               count: 1
-              capabilities: [ gpu ]
+              capabilities: [gpu]
     healthcheck:
-      test: [ "CMD-SHELL", "pgrep -f 'module.yml' || exit 1" ]
+      # pgrep -f 'module.yml': kiểm tra tiến trình Savant còn chạy.
+      # start_period: 120s bời TensorRT cần ~60-120s để build engine lần đầu,
+      # retries: 10 giới hạn số lần fail trước khi Docker đánh dấu unhealthy → restart.
+      test: ["CMD-SHELL", "pgrep -f 'module.yml' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 10
-      start_period: 120s # Savant cần ~60-120s để load model TensorRT lần đầu
+      start_period: 120s
 
-  # ── Egress: Xuất JSON metadata ──
-  json-egress:
-    image: ghcr.io/insight-platform/savant-adapters-py:latest
-    restart: unless-stopped
-    entrypoint: python
-    command:
-      - /opt/savant/adapters/python/sinks/metadata_json.py
-    depends_on:
-      savant-ai-core:
-        condition: service_healthy
-    volumes:
-      - zmq-sockets:/tmp/zmq-sockets
-      - ./output:/output
-    networks:
-      - svpro-net
-    environment:
-      - ZMQ_ENDPOINT=sub+connect:ipc:///tmp/zmq-sockets/output-video.ipc
-      - ZMQ_TYPE=SUB
-      - DIR=/output
-      - FILENAME_PATTERN=%source_id-%timestamp
-      - CHUNK_SIZE=0
-      - ZMQ_SNDHWM=100
-      - ZMQ_RCVHWM=100
-      - PYTHONPATH=/opt/savant
-
-  # ── Egress: Always-On RTSP Video Output (cần Linux + DeepStream adapter) ──
-  video-egress:
-    profiles: [ "rtsp-out" ] # Chỉ chạy khi: docker compose --profile rtsp-out up
-    image: ghcr.io/insight-platform/savant-adapters-gstreamer:latest
-    restart: unless-stopped
-    entrypoint: /opt/savant/adapters/gst/sinks/always_on_rtsp.sh
-    ports:
-      - "554:554" # RTSP output
-      - "888:888" # Player HTTP
-    networks:
-      - svpro-net
-    environment:
-      - ZMQ_ENDPOINT=sub+connect:ipc:///tmp/zmq-sockets/output-video.ipc
-      - SOURCE_ID=cam_online_1
-      - MAX_DELAY_MS=1000
-      - STUB_FILE_LOCATION=/opt/savant/adapters/gst/sinks/stub_imgs/smpte100_1280x720.jpeg
-      - FRAMERATE=15/1
-      - CODEC=h264
-      - BITRATE=4000000
-      - GST_PLUGIN_PATH=/opt/savant/adapters/gst/gst_plugins
-    volumes:
-      - zmq-sockets:/tmp/zmq-sockets
+  # [REMOVED] json-egress: Không có consumer đọc file /output — AI Core gửi event trực tiếp
+  # qua alert_manager → POST /api/events/ingest và audit_logger → psycopg2 → DB.
+  #
+  # [REMOVED] video-egress: Linux-only, được thay thế bằng go2rtc WebRTC/RTSP output.
 
   # ── PostgreSQL + pgvector ──
   postgres:
@@ -142,7 +168,7 @@ services:
     networks:
       - svpro-net
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-svpro_user}" ]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-svpro_user}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -174,8 +200,12 @@ services:
         PGPASSWORD=$$POSTGRES_PASSWORD psql -h postgres -U $$POSTGRES_USER -d $$POSTGRES_DB -c \"GRANT ALL ON SCHEMA public TO $$POSTGRES_USER\"
         echo '▶ Bước 3: Chạy schema...'
         PGPASSWORD=$$POSTGRES_PASSWORD psql -h postgres -U $$POSTGRES_USER -d $$POSTGRES_DB -f /sql/schema.sql
-        echo '▶ Bước 4: Chạy migration...'
+        echo '▶ Bước 4: Chạy migration 001...'
         PGPASSWORD=$$POSTGRES_PASSWORD psql -h postgres -U $$POSTGRES_USER -d $$POSTGRES_DB -f /sql/migrations/001_sprint4_5.sql
+        echo '▶ Bước 4b: Chạy migration 002 (PG NOTIFY trigger)...'
+        PGPASSWORD=$$POSTGRES_PASSWORD psql -h postgres -U $$POSTGRES_USER -d $$POSTGRES_DB -f /sql/migrations/002_camera_notify_trigger.sql
+        echo '▶ Bước 4c: Chạy migration 003 (Enrollment support)...'
+        PGPASSWORD=$$POSTGRES_PASSWORD psql -h postgres -U $$POSTGRES_USER -d $$POSTGRES_DB -f /sql/migrations/003_enrollment_support.sql
         echo '▶ Bước 5: Seed cameras...'
         PGPASSWORD=$$POSTGRES_PASSWORD psql -h postgres -U $$POSTGRES_USER -d $$POSTGRES_DB -f /sql/seed_cameras.sql
         echo '🎉 DB migrations + seed hoàn tất.'
@@ -196,7 +226,7 @@ services:
     networks:
       - svpro-net
     healthcheck:
-      test: [ "CMD-SHELL", "wget -qO- http://localhost:80 || exit 1" ]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:80 || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -222,13 +252,23 @@ services:
     environment:
       POSTGRES_DSN: postgresql://${POSTGRES_USER:-svpro_user}:${POSTGRES_PASSWORD:-svpro_pass}@postgres:5432/${POSTGRES_DB:-svpro_db}
       REDIS_HOST: redis
-      # CORS: cho phép frontend (nginx) truy cập từ mọi origin (localhost + IP thực)
-      # Quan trọng: FE dùng relative path /api/* qua nginx proxy, không hardcode IP ở browser
+      REDIS_PORT: 6379
+      GO2RTC_URL: http://go2rtc:1984
+      GO2RTC_RTSP_URL: rtsp://go2rtc:8554
+      # URL đến Enrollment HTTP Service bên trong savant-ai-core
+      AI_CORE_ENROLL_URL: http://savant-ai-core:8090
+      # CORS
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:5173,http://localhost:8081,http://192.168.42.171:8081,http://192.168.42.171}
     networks:
       - svpro-net
     healthcheck:
-      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" ]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')",
+        ]
       interval: 20s
       timeout: 15s
       retries: 5
@@ -246,7 +286,7 @@ services:
     networks:
       - svpro-net
     healthcheck:
-      test: [ "CMD", "redis-cli", "ping" ]
+      test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -264,14 +304,22 @@ services:
     networks:
       - svpro-net
     command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--storage.tsdb.retention.time=15d'
-      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
-      - '--web.console.templates=/usr/share/prometheus/consoles'
-      - '--web.enable-lifecycle'
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+      - "--web.enable-lifecycle"
     healthcheck:
-      test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9090/-/healthy" ]
+      test:
+        [
+          "CMD",
+          "wget",
+          "--no-verbose",
+          "--tries=1",
+          "--spider",
+          "http://localhost:9090/-/healthy",
+        ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -297,7 +345,15 @@ services:
       prometheus:
         condition: service_healthy
     healthcheck:
-      test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/api/health" ]
+      test:
+        [
+          "CMD",
+          "wget",
+          "--no-verbose",
+          "--tries=1",
+          "--spider",
+          "http://localhost:3000/api/health",
+        ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -342,5 +398,3 @@ volumes:
 networks:
   svpro-net:
     driver: bridge
-
-

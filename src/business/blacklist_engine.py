@@ -108,8 +108,9 @@ class BlacklistEngine:
 
     def __init__(self):
         # Models/connections (khởi tạo sau qua initialize())
-        self._db_dsn: str | None = None
-        self._redis   = None
+        self._db_dsn: str | None  = None
+        self._db_pool             = None   # psycopg2.pool.ThreadedConnectionPool
+        self._redis               = None
 
         # L1 cache riêng cho người và xe
         self._person_cache  = _L1BLCache()
@@ -146,6 +147,16 @@ class BlacklistEngine:
         self._zone_time_rules = zone_time_rules or {}
         self._initialized   = True
 
+        # Connection pool dùng chung cho DB fallback lookups (L1+Redis miss)
+        self._db_pool = None
+        if db_dsn:
+            try:
+                import psycopg2.pool
+                self._db_pool = psycopg2.pool.ThreadedConnectionPool(1, 3, db_dsn)
+                logger.info("BlacklistEngine DB pool created (min=1, max=3).")
+            except Exception as exc:
+                logger.warning("BlacklistEngine DB pool init failed: %s — DB fallback disabled.", exc)
+
         if redis_client:
             self._prefetch_blacklist_to_redis()
         logger.info("BlacklistEngine initialized. Camera zones: %s", self._camera_zones)
@@ -155,15 +166,21 @@ class BlacklistEngine:
         Tải danh sách blacklist từ DB lên Redis khi startup.
         Giúp tra cứu nhanh mà không cần mở kết nối DB mỗi frame.
         """
-        if not self._db_dsn or not self._redis:
+        if not self._db_pool or not self._redis:
             return
+        conn = None
         try:
-            import psycopg2, json
-            conn = psycopg2.connect(self._db_dsn)
+            import json
+            conn = self._db_pool.getconn()
             cur  = conn.cursor()
 
             pipe = self._redis.pipeline(transaction=False)
             count = 0
+            # Blacklist người
+            cur.execute(
+                "SELECT id, name, blacklist_reason FROM users"
+                " WHERE role = 'blacklist' AND active = TRUE"
+            )
             for uid, name, reason in cur.fetchall():
                 key = f"svpro:bl:person:{uid}"
                 pipe.setex(key, _REDIS_BL_TTL, json.dumps({"name": name or "", "reason": reason or "blacklisted"}))
@@ -178,10 +195,12 @@ class BlacklistEngine:
 
             pipe.execute()
             cur.close()
-            conn.close()
             logger.info("Prefetched %d blacklist entries → Redis.", count)
         except Exception as exc:
             logger.warning("Blacklist prefetch failed: %s", exc)
+        finally:
+            if conn:
+                self._db_pool.putconn(conn)
 
     # ──────────────────────────────────────────────────────────────────────────
     # API công khai — được gọi từ pyfunc plugins
@@ -337,19 +356,19 @@ class BlacklistEngine:
         return self._check_vehicle_db(plate_number)
 
     def _check_person_db(self, person_id: str) -> tuple[bool, str]:
-        """Query trực tiếp DB khi L1 và Redis đều miss."""
-        if not self._db_dsn:
+        """Query trực tiếp DB khi L1 và Redis đều miss. Dùng connection pool."""
+        if not self._db_pool:
             return False, ""
+        conn = None
         try:
-            import psycopg2
-            conn = psycopg2.connect(self._db_dsn)
+            conn = self._db_pool.getconn()
             cur  = conn.cursor()
             cur.execute(
                 "SELECT role, blacklist_reason FROM users WHERE id = %s AND active = TRUE",
                 (person_id,),
             )
             row = cur.fetchone()
-            cur.close(); conn.close()
+            cur.close()
             if row and row[0] == "blacklist":
                 reason = row[1] or "blacklisted"
                 self._person_cache.put(person_id, True, reason)
@@ -359,21 +378,24 @@ class BlacklistEngine:
         except Exception as exc:
             logger.debug("DB person blacklist check fail: %s", exc)
             return False, ""
+        finally:
+            if conn:
+                self._db_pool.putconn(conn)
 
     def _check_vehicle_db(self, plate_number: str) -> tuple[bool, str]:
-        """Query trực tiếp DB khi L1 và Redis đều miss."""
-        if not self._db_dsn:
+        """Query trực tiếp DB khi L1 và Redis đều miss. Dùng connection pool."""
+        if not self._db_pool:
             return False, ""
+        conn = None
         try:
-            import psycopg2
-            conn = psycopg2.connect(self._db_dsn)
+            conn = self._db_pool.getconn()
             cur  = conn.cursor()
             cur.execute(
                 "SELECT blacklist_reason FROM vehicles WHERE plate_number = %s AND is_blacklisted = TRUE",
                 (plate_number,),
             )
             row = cur.fetchone()
-            cur.close(); conn.close()
+            cur.close()
             if row:
                 reason = row[0] or "blacklisted"
                 self._vehicle_cache.put(plate_number, True, reason)
@@ -383,6 +405,9 @@ class BlacklistEngine:
         except Exception as exc:
             logger.debug("DB vehicle blacklist check fail: %s", exc)
             return False, ""
+        finally:
+            if conn:
+                self._db_pool.putconn(conn)
 
     def _check_time_rule(
         self, zone: str, person_id: str, person_name: str,
