@@ -16,11 +16,11 @@ export default defineConfig({
         target: 'http://localhost:8000',
         changeOrigin: true,
       },
-      // Proxy WebSocket cho camera stream (jsmpeg)
-      '/ws': {
-        target: 'ws://localhost:8000',
-        ws: true,
+      // Proxy go2rtc API để lấy stream info
+      '/go2rtc-api': {
+        target: 'http://localhost:1984',
         changeOrigin: true,
+        rewrite: (path: string) => path.replace(/^\/go2rtc-api/, ''),
       },
     },
   },

@@ -206,6 +206,8 @@ services:
         PGPASSWORD=$$POSTGRES_PASSWORD psql -h postgres -U $$POSTGRES_USER -d $$POSTGRES_DB -f /sql/migrations/002_camera_notify_trigger.sql
         echo '▶ Bước 4c: Chạy migration 003 (Enrollment support)...'
         PGPASSWORD=$$POSTGRES_PASSWORD psql -h postgres -U $$POSTGRES_USER -d $$POSTGRES_DB -f /sql/migrations/003_enrollment_support.sql
+        echo '▶ Bước 4d: Chạy migration 004 (Snapshot images)...'
+        PGPASSWORD=$$POSTGRES_PASSWORD psql -h postgres -U $$POSTGRES_USER -d $$POSTGRES_DB -f /sql/migrations/004_snapshot_images.sql
         echo '▶ Bước 5: Seed cameras...'
         PGPASSWORD=$$POSTGRES_PASSWORD psql -h postgres -U $$POSTGRES_USER -d $$POSTGRES_DB -f /sql/seed_cameras.sql
         echo '🎉 DB migrations + seed hoàn tất.'
@@ -259,6 +261,8 @@ services:
       AI_CORE_ENROLL_URL: http://savant-ai-core:8090
       # CORS
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:5173,http://localhost:8081,http://192.168.42.171:8081,http://192.168.42.171}
+    volumes:
+      - snapshot_data:/data
     networks:
       - svpro-net
     healthcheck:
@@ -394,6 +398,7 @@ volumes:
   redis_data:
   prometheus_data:
   grafana_data:
+  snapshot_data:
 
 networks:
   svpro-net:

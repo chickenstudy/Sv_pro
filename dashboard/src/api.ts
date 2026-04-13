@@ -225,3 +225,83 @@ export const doorsApi = {
       })
     })
 }
+
+// ── Stream API (go2rtc) ────────────────────────────────────────────────────────
+
+export interface StreamUrlSet {
+  webrtc:    string
+  hls:       string
+  mse:       string
+  rtsp:      string
+  player_ui: string
+}
+
+export interface StreamInfo {
+  camera_id: number
+  source_id:  string
+  urls:       StreamUrlSet
+}
+
+export interface StreamStatus {
+  camera_id:  number
+  source_id:  string
+  active:     boolean
+  producers:  number
+  consumers:  number
+  urls?:      StreamUrlSet
+}
+
+export const streamApi = {
+  /** Lấy URLs stream cho 1 camera từ go2rtc. */
+  getInfo: (camId: number) =>
+    apiFetch<StreamInfo>(`/api/stream/${camId}/info`),
+
+  /** Lấy trạng thái stream (active/consumers) từ go2rtc. */
+  getStatus: (camId: number) =>
+    apiFetch<StreamStatus>(`/api/stream/${camId}/status`),
+
+  /** Danh sách tất cả streams đang active trên go2rtc. */
+  listActive: () =>
+    apiFetch<{ total: number; streams: Array<StreamInfo & { producers: number; consumers: number }> }>('/api/stream/active'),
+}
+
+// ── Images API ─────────────────────────────────────────────────────────────────
+
+export interface SnapshotImage {
+  id:             number
+  camera_id:      string
+  event_id:       string | null
+  entity_id:      string | null
+  entity_type:    string | null
+  image_path:     string
+  thumbnail_path: string | null
+  storage_type:   string
+  width:          number | null
+  height:         number | null
+  file_size_bytes: number | null
+  detected_at:    string
+  created_at:     string
+}
+
+export const imagesApi = {
+  list: (params?: {
+    camera_id?: string
+    entity_id?: string
+    entity_type?: string
+    from?: string
+    to?: string
+    limit?: number
+    offset?: number
+  }) => {
+    const q = new URLSearchParams()
+    if (params?.camera_id)    q.set('camera_id', params.camera_id)
+    if (params?.entity_id)    q.set('entity_id', params.entity_id)
+    if (params?.entity_type)  q.set('entity_type', params.entity_type)
+    if (params?.from)         q.set('from', params.from)
+    if (params?.to)           q.set('to', params.to)
+    if (params?.limit)        q.set('limit', String(params.limit))
+    if (params?.offset)       q.set('offset', String(params.offset))
+    return apiFetch<SnapshotImage[]>(`/api/images?${q}`)
+  },
+  get: (id: number) => apiFetch<SnapshotImage>(`/api/images/${id}`),
+}
