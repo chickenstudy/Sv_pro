@@ -16,7 +16,14 @@ rtsp:
 
 # ── WebRTC (Browser stream trực tiếp, không qua backend FFmpeg) ───────────────
 webrtc:
-  listen: ":8555"    # WebRTC signaling
+  listen: ":8555"    # WebRTC signaling (trong container)
+  # ICE candidates: go2rtc quảng bá địa chỉ này cho browser khi thiết lập kết nối.
+  # Docker map 8557:8555 nên browser phải kết nối tới HOST_IP:8557, không phải :8555.
+  # Thiếu dòng này → go2rtc quảng bá port 8555 (container-internal) → browser không reach được.
+  # Đồng thời docker-compose.yml phải map cả TCP và UDP: "8557:8555/tcp" + "8557:8555/udp"
+  # vì WebRTC DTLS/SRTP media chạy trên UDP.
+  candidates:
+    - 192.168.42.171:8557   # HOST_IP:HOST_PORT (khớp với port mapping trong docker-compose)
   # STUN server cho LAN — không cần TURN nếu client trong cùng mạng
   ice_servers:
     - urls: [stun:stun.l.google.com:19302]

@@ -7,7 +7,8 @@ services:
     ports:
       - "1985:1984" # HTTP API + WebUI (1985 trên host tránh trùng VMS go2rtc)
       - "8556:8554" # RTSP re-stream (cho Savant AI Core)
-      - "8557:8555" # WebRTC
+      - "8557:8555/tcp" # WebRTC signaling (TCP)
+      - "8557:8555/udp" # WebRTC media — DTLS/SRTP chạy trên UDP, bắt buộc phải map UDP
     volumes:
       - ./config/go2rtc.yaml:/config/go2rtc.yaml:ro
     networks:
@@ -53,14 +54,18 @@ services:
 
   # ── savant-rtsp-ingress: RTSP Pull từ go2rtc → ZMQ Push vào Savant AI Core ──
   # Chức năng: Đọc frame RTSP từ go2rtc:8554/{source_id} cho từng camera active.
-  #            Encode frame → push vào input-video.ipc cho savant-ai-core (ZMQ SUB).
+  #            Encode frame thành Savant RS VideoFrame protobuf → push vào ZMQ IPC.
   # Lắng nghe PG NOTIFY để tự động thêm/xóa camera stream khi DB thay đổi.
+  #
+  # QUAN TRỌNG: Phải dùng Dockerfile.savant-ai-core (KHÔNG dùng Dockerfile.backend)
+  # vì savant_rs (serialize VideoFrame protobuf) chỉ có trong image savant-deepstream.
+  # Cả hai service dùng cùng Dockerfile → Docker cache chia sẻ, không tốn disk gấp đôi.
   savant-rtsp-ingress:
     build:
       context: .
-      dockerfile: Dockerfile.backend
+      dockerfile: Dockerfile.savant-ai-core
     restart: unless-stopped
-    entrypoint: python
+    entrypoint: /opt/venv/bin/python   # venv của savant-deepstream chứa savant_rs
     command: ["-m", "src.ingress.rtsp_ingest"]
     depends_on:
       go2rtc-sync:
@@ -73,7 +78,8 @@ services:
     networks:
       - svpro-net
     environment:
-      - PYTHONPATH=/opt/savant/user_data
+      # /opt/savant = Savant framework libs (có savant_rs), /opt/savant/user_data = code của mình
+      - PYTHONPATH=/opt/savant:/opt/savant/user_data
       - GO2RTC_URL=http://svpro-go2rtc:1984
       - GO2RTC_RTSP_BASE=rtsp://svpro-go2rtc:8554
       - ZMQ_PUB_ENDPOINT=pub+connect:ipc:///tmp/zmq-sockets/input-video.ipc
@@ -81,7 +87,7 @@ services:
       - POLL_INTERVAL_SECS=30
       - TARGET_FPS=10
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import sys; sys.exit(0)\" || exit 1"]
+      test: ["CMD-SHELL", "/opt/venv/bin/python -c \"import sys; sys.exit(0)\" || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -145,6 +151,10 @@ services:
       timeout: 10s
       retries: 10
       start_period: 120s
+    # Phải cùng network với postgres và redis để resolve hostname.
+    # Thiếu dòng này → "Temporary failure in name resolution" cho postgres/redis/backend.
+    networks:
+      - svpro-net
 
   # [REMOVED] json-egress: Không có consumer đọc file /output — AI Core gửi event trực tiếp
   # qua alert_manager → POST /api/events/ingest và audit_logger → psycopg2 → DB.

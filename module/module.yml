@@ -95,10 +95,10 @@ pipeline:
         # ROI zones — zone mặc định toàn frame, được cập nhật qua /api/cameras/{id}/config
         # Format: source_id → [x1, y1, x2, y2] (pixel coords của full frame)
         roi_zones:
-          cam_01: [0, 0, 2592, 1944]       # Camera cổng chính (toàn frame)
-          cam_02: [200, 100, 2392, 1844]   # Camera bãi giữ xe (loại rìa khung)
-          cam_03: [0, 0, 2592, 972]        # Camera làn vào (nửa trên frame)
-          cam_dummy_01: [0, 0, 1280, 720]  # Ingress giả lập (dummy stream)
+          cam_online_1: [0, 0, 2592, 1944]   # Camera cổng chính (seed: name='cam_online_1')
+          cam_02: [200, 100, 2392, 1844]     # Camera bãi giữ xe — cập nhật key khi thêm camera thật
+          cam_03: [0, 0, 2592, 972]          # Camera làn vào — cập nhật key khi thêm camera thật
+          cam_dummy_01: [0, 0, 1280, 720]    # Ingress giả lập (dummy stream)
         # Night mode: tự động kích hoạt CLAHE preprocess khi mean brightness < threshold
         night_mode_threshold: 80         # Mean pixel value 0-255
         # Temporal voting: số frame tích lũy trước khi quyết định biển số
@@ -151,7 +151,7 @@ pipeline:
       kwargs:
         # Zones và quyền truy cập theo camera
         camera_zones:
-          cam_01: "gate"
+          cam_online_1: "gate"       # seed camera — source_id = name column
           cam_02: "parking"
           cam_03: "entrance"
           cam_dummy_01: "test"

@@ -71,15 +71,17 @@ class CameraRow:
     def make(row: tuple) -> "CameraRow":
         """Build from (id, name, rtsp_url, enabled) tuple."""
         row_id, row_name, row_rtsp, row_enabled = row
-        sid = f"cam_{row_id}"
+        # source_id phải khớp với COALESCE(name, 'cam_' || id::text) trong trigger
+        # và với keys trong module.yml roi_zones / camera_zones.
+        sid = row_name if row_name else f"cam_{row_id}"
         return CameraRow(id=row_id, name=row_name, rtsp_url=row_rtsp, source_id=sid, enabled=row_enabled)
 
 
-def fetch_cameras(dsn: str) -> list[CameraRow]:
-    """Lấy danh sách camera enabled từ PostgreSQL.
+def fetch_cameras(dsn: str) -> "list[CameraRow] | None":
+    """Lấy danh sách camera từ PostgreSQL.
 
-    source_id luôn là 'cam_{id}' — đảm bảo mỗi camera có stream name DUY NHẤT,
-    bất kể name có trùng nhau hay không.
+    Trả về None khi DB không thể kết nối — caller phải xử lý None
+    như "không thay đổi gì" thay vì xóa sạch streams hiện tại.
     """
     try:
         conn = psycopg2.connect(dsn)
@@ -95,17 +97,24 @@ def fetch_cameras(dsn: str) -> list[CameraRow]:
         return rows
     except Exception as exc:
         log.error("DB fetch_cameras failed: %s", exc)
-        return []
+        return None
 
 
-def sync_to_go2rtc(cameras: list[CameraRow], client: httpx.Client) -> None:
+def sync_to_go2rtc(cameras: "list[CameraRow] | None", client: httpx.Client) -> None:
     """
     Đồng bộ danh sách camera với go2rtc qua REST API.
+
+    cameras=None có nghĩa DB tạm thời không khả dụng — bỏ qua sync
+    để tránh xóa sạch tất cả streams đang chạy.
 
     go2rtc API:
       PUT    /api/streams?name={source_id}  body=rtsp_url  → thêm/cập nhật stream
       DELETE /api/streams?src={source_id}                 → xóa stream
     """
+    if cameras is None:
+        log.warning("fetch_cameras returned None (DB unreachable) — skipping sync to preserve existing streams.")
+        return
+
     try:
         resp = client.get(f"{GO2RTC_URL}/api/streams")
         resp.raise_for_status()

@@ -36,11 +36,36 @@ import httpx
 import psycopg2
 import psycopg2.extensions
 
+# savant_rs phải có sẵn trong image (Dockerfile.savant-ai-core).
+# Import sớm để lỗi xuất hiện ngay khi startup, không phải lúc push frame đầu tiên.
+try:
+    from savant_rs.primitives import (
+        VideoFrame,
+        VideoFrameContent,
+        VideoFrameTranscodingMethod,
+    )
+    from savant_rs.utils.serialization import Message as SavantMessage
+    _SAVANT_RS_OK = True
+except ImportError as _savant_err:
+    _SAVANT_RS_OK = False
+    # Log lỗi sau khi logging được khởi tạo (xem phần cuối module)
+    _SAVANT_RS_ERR = _savant_err
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("rtsp-ingest")
+
+if not _SAVANT_RS_OK:
+    log.critical(
+        "savant_rs không tìm thấy: %s\n"
+        "  → Container savant-rtsp-ingress phải dùng Dockerfile.savant-ai-core "
+        "(không phải Dockerfile.backend).\n"
+        "  → Chạy: docker compose build savant-rtsp-ingress",
+        _SAVANT_RS_ERR,
+    )
+    sys.exit(1)
 
 # ── Config từ env ──────────────────────────────────────────────────────────────
 GO2RTC_URL        = os.environ.get("GO2RTC_URL", "http://svpro-go2rtc:1984")
@@ -52,6 +77,17 @@ TARGET_FPS        = int(os.environ.get("TARGET_FPS", "10"))        # FPS gửi v
 CHANNEL           = "cameras_changed"
 
 _running = True
+
+# PTS (presentation timestamp) tracking per source_id.
+# Đơn vị: microseconds (time_base = 1/1_000_000).
+# Mỗi frame tăng thêm 1_000_000 / TARGET_FPS µs.
+_pts_counters: dict[str, int] = {}
+_PTS_TIME_BASE = (1, 1_000_000)  # 1 µs per unit
+
+# ZMQ socket KHÔNG thread-safe — nhiều StreamWorker thread gọi send_multipart()
+# đồng thời trên cùng 1 socket → message interleaving / segfault.
+# Lock này serialize tất cả ZMQ writes về một thread tại một thời điểm.
+_zmq_lock = threading.Lock()
 
 
 def _sighandler(sig, _frame):
@@ -120,6 +156,10 @@ class StreamWorker:
                     log.warning("[%s] Cannot open RTSP — retry in 5s", self.config.source_id)
                     time.sleep(5)
                     continue
+                # Giới hạn internal buffer của OpenCV về 1 frame.
+                # Mặc định OpenCV buffer 4-10 frame → Savant nhận frame cũ
+                # thay vì frame mới nhất khi pipeline chậm hơn capture rate.
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 log.info("✅ Connected: [%s]", self.config.source_id)
 
             # Throttle FPS để không gửi quá nhanh vào DeepStream
@@ -147,18 +187,56 @@ class StreamWorker:
 
 def _push_frame_zmq(publisher, source_id: str, frame) -> None:
     """
-    Encode frame thành bytes và gửi qua ZMQ PUB tới Savant AI Core.
+    Encode frame thành Savant RS VideoFrame protobuf và gửi qua ZMQ PUB.
 
-    Format: [source_id_bytes][frame_jpeg_bytes]
-    Savant nhận multipart message: [topic, payload].
+    Savant AI Core dùng savant_rs để decode ZMQ message — nó kỳ vọng:
+      multipart[0] = source_id (ZMQ topic, dùng để filter)
+      multipart[1] = Message.serialize() (protobuf VideoFrame)
+
+    KHÔNG được gửi raw JPEG bytes vì protobuf decoder sẽ fail với
+    "invalid wire type value: 7" (0xFF = field 31, wire type 7 không tồn tại).
     """
     if publisher is None:
         return
     try:
-        _, jpeg_buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        jpeg_bytes  = jpeg_buf.tobytes()
-        # ZMQ multipart: topic = source_id, data = jpeg
-        publisher.send_multipart([source_id.encode(), jpeg_bytes])
+        h, w = frame.shape[:2]
+
+        # Encode JPEG (quality 85 — đủ cho AI, tiết kiệm băng thông ZMQ)
+        ok, jpeg_buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if not ok or jpeg_buf is None:
+            log.warning("[%s] cv2.imencode failed — frame skipped", source_id)
+            return
+        jpeg_bytes = jpeg_buf.tobytes()
+
+        # PTS tăng đơn điệu per source_id (µs)
+        pts_step = int(_PTS_TIME_BASE[1] / max(TARGET_FPS, 1))
+        pts = _pts_counters.get(source_id, 0)
+        _pts_counters[source_id] = pts + pts_step
+
+        # Tạo Savant RS VideoFrame
+        vf = VideoFrame(
+            source_id=source_id,
+            framerate=f"{TARGET_FPS}/1",
+            width=w,
+            height=h,
+            transcoding_method=VideoFrameTranscodingMethod.Copy,
+            codec="jpeg",
+            keyframe=True,    # mỗi JPEG là independent frame
+            pts=pts,
+            dts=None,
+            duration=None,
+            time_base=_PTS_TIME_BASE,
+        )
+        vf.content = VideoFrameContent.internal(jpeg_bytes)
+
+        # Serialize → protobuf bytes → gửi ZMQ multipart
+        # Lock bắt buộc: ZMQ socket không thread-safe, mỗi StreamWorker
+        # chạy trên thread riêng và gọi hàm này đồng thời.
+        msg = SavantMessage.video_frame(vf)
+        data = msg.serialize()
+        with _zmq_lock:
+            publisher.send_multipart([source_id.encode(), data])
+
     except Exception as exc:
         log.debug("[%s] ZMQ push error: %s", source_id, exc)
 
@@ -216,35 +294,41 @@ class StreamManager:
 
 # ── go2rtc stream discovery ────────────────────────────────────────────────────
 
-def fetch_active_streams(client: httpx.Client) -> dict[str, str]:
+def fetch_active_streams() -> dict[str, str]:
     """
-    Lấy danh sách streams đã đăng ký với go2rtc.
+    Lấy danh sách cameras enabled từ PostgreSQL và map sang go2rtc RTSP re-stream URL.
 
-    Trả về {source_id: rtsp_url} cho mọi stream go2rtc biết (không filter producers).
-    StreamWorker sẽ tự retry kết nối nếu camera chưa online — không cần đợi ở đây.
+    Trả về {source_id: rtsp://svpro-go2rtc:8554/{source_id}}.
 
-    go2rtc tự động:
-      - Connect RTSP source khi có PUT /api/streams
-      - Reconnect khi camera drop
-      - Expose re-stream tại rtsp://svpro-go2rtc:8554/{source_id} ngay khi đăng ký
+    Không dùng GET /api/streams của go2rtc vì go2rtc 1.9.x dùng lazy-connection model:
+    dynamic streams thêm qua REST API chỉ hiện trong /api/streams khi đã có consumer
+    → GET trả về {} mặc dù PUT đã thành công 200 OK.
+
+    source_id = camera.name nếu có, ngược lại 'cam_{id}'
+    — khớp với go2rtc_sync.py và NOTIFY trigger COALESCE(name, 'cam_' || id::text).
     """
     try:
-        resp = client.get(f"{GO2RTC_URL}/api/streams", timeout=5.0)
-        resp.raise_for_status()
-        raw_body = resp.text
-        log.info("go2rtc /api/streams raw response: %s", raw_body[:500])
-        raw = json.loads(raw_body) if raw_body.strip() else {}
-        streams: dict = raw if isinstance(raw, dict) else {}
-        if streams:
-            log.info("go2rtc streams: %s", streams)
+        conn = psycopg2.connect(DB_DSN)
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, name, rtsp_url, enabled "
+            "FROM cameras WHERE enabled = true ORDER BY id"
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        result: dict[str, str] = {}
+        for row_id, row_name, _rtsp, _enabled in rows:
+            sid = row_name if row_name else f"cam_{row_id}"
+            result[sid] = f"{GO2RTC_RTSP_BASE}/{sid}"
+        if result:
+            log.info("DB cameras for ingest: %s", list(result.keys()))
         else:
-            log.warning("go2rtc /api/streams returned empty — raw: %s", raw_body[:200])
-        return {
-            sid: f"{GO2RTC_RTSP_BASE}/{sid}"
-            for sid, data in streams.items()
-        }
+            log.warning("No enabled cameras found in DB")
+        return result
     except Exception as exc:
-        log.error("Cannot reach go2rtc API: %s", exc)
+        log.error("DB fetch_cameras failed: %s", exc)
         return {}
 
 
@@ -263,38 +347,32 @@ def wait_for_go2rtc(client: httpx.Client, max_retries: int = 30) -> bool:
     return False
 
 
-def _wait_for_streams(client: httpx.Client, timeout_sec: int = 90) -> list[str]:
+def _wait_for_streams(timeout_sec: int = 90) -> list[str]:
     """
-    Chờ cho đến khi go2rtc có ít nhất 1 stream đăng ký.
-    Retry ngắn (2s) trong timeout_sec giây — tránh race với go2rtc-sync.
+    Chờ cho đến khi DB có ít nhất 1 camera enabled.
+    Retry mỗi 2s trong timeout_sec giây — tránh race với DB migration startup.
     """
     deadline = time.monotonic() + timeout_sec
     attempt = 0
     while time.monotonic() < deadline:
         attempt += 1
-        try:
-            resp = client.get(f"{GO2RTC_URL}/api/streams", timeout=5.0)
-            resp.raise_for_status()
-            streams: dict = resp.json() or {}
-            names = list(streams.keys())
-            if names:
-                log.info("Found %d stream(s) in go2rtc: %s", len(names), names)
-                return names
-            log.info("Waiting for streams to appear in go2rtc... (attempt %d)", attempt)
-        except Exception as exc:
-            log.warning("Error polling streams (attempt %d): %s", attempt, exc)
+        streams = fetch_active_streams()
+        if streams:
+            log.info("Found %d camera(s) in DB: %s", len(streams), list(streams.keys()))
+            return list(streams.keys())
+        log.info("Waiting for cameras in DB... (attempt %d)", attempt)
         time.sleep(2)
-    log.warning("Timeout waiting for streams — will sync on next poll cycle")
+    log.warning("Timeout waiting for cameras in DB — will sync on next poll cycle")
     return []
 
 
 # ── PG NOTIFY loop ─────────────────────────────────────────────────────────────
 
-def listen_loop(http_client: httpx.Client, manager: StreamManager) -> None:
+def listen_loop(manager: StreamManager) -> None:
     """
     Main loop: LISTEN PostgreSQL NOTIFY 'cameras_changed' + fallback poll.
 
-    Camera thay đổi → NOTIFY → sync streams với go2rtc ngay lập tức.
+    Camera thay đổi → NOTIFY → re-fetch DB và sync workers ngay lập tức.
     Fallback: poll mỗi POLL_INTERVAL giây để đảm bảo không bỏ sót.
     """
     conn: psycopg2.extensions.connection | None = None
@@ -309,7 +387,7 @@ def listen_loop(http_client: httpx.Client, manager: StreamManager) -> None:
                 cur.close()
                 log.info("PG LISTEN registered on '%s'", CHANNEL)
                 # Full sync khi mới kết nối
-                manager.sync(fetch_active_streams(http_client))
+                manager.sync(fetch_active_streams())
             except Exception as exc:
                 log.error("PG LISTEN setup failed: %s — retrying in 5s", exc)
                 if conn:
@@ -324,7 +402,7 @@ def listen_loop(http_client: httpx.Client, manager: StreamManager) -> None:
         try:
             if select.select([conn], [], [], POLL_INTERVAL) == ([], [], []):
                 # Timeout: fallback sync định kỳ
-                manager.sync(fetch_active_streams(http_client))
+                manager.sync(fetch_active_streams())
             else:
                 conn.poll()
                 while conn.notifies:
@@ -335,7 +413,7 @@ def listen_loop(http_client: httpx.Client, manager: StreamManager) -> None:
                                  payload.get("op"), payload.get("id"), payload.get("source_id"))
                     except Exception:
                         pass
-                    manager.sync(fetch_active_streams(http_client))
+                    manager.sync(fetch_active_streams())
 
         except Exception as exc:
             log.error("PG LISTEN loop error: %s — reconnecting", exc)
@@ -354,7 +432,13 @@ def listen_loop(http_client: httpx.Client, manager: StreamManager) -> None:
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def _init_zmq():
-    """Khởi tạo ZMQ PUB socket để push frames vào Savant AI Core."""
+    """
+    Khởi tạo ZMQ PUB socket để push frames vào Savant AI Core.
+
+    Pattern: AI Core SUB binds (tạo endpoint) → rtsp_ingest PUB connects.
+    Sau khi connect phải sleep ~500ms để ZMQ subscription propagate
+    (tránh "slow joiner syndrome" — các frame đầu tiên bị drop).
+    """
     try:
         import zmq
         ctx = zmq.Context()
@@ -362,6 +446,8 @@ def _init_zmq():
         if "connect" in ZMQ_PUB_ENDPOINT:
             addr = ZMQ_PUB_ENDPOINT.replace("pub+connect:", "")
             sock.connect(addr)
+            # Slow-joiner fix: chờ subscription propagate trước khi gửi frame đầu
+            time.sleep(0.5)
         else:
             addr = ZMQ_PUB_ENDPOINT.replace("pub+bind:", "")
             sock.bind(addr)
@@ -386,14 +472,14 @@ def main():
         log.error("go2rtc not available after retries — exiting.")
         sys.exit(1)
 
-    # Chờ streams xuất hiện trong go2rtc (tránh race với go2rtc-sync startup)
-    _wait_for_streams(http_client)
+    # Chờ cameras xuất hiện trong DB (tránh race với DB migration startup)
+    _wait_for_streams()
 
     zmq_pub = _init_zmq()
     manager = StreamManager(zmq_publisher=zmq_pub)
 
     try:
-        listen_loop(http_client, manager)
+        listen_loop(manager)
     finally:
         manager.stop_all()
         http_client.close()
