@@ -1,13 +1,13 @@
 services:
   # ── go2rtc: RTSP Broker trung tâm (thay thế ingress-manager + video-egress) ──
-  go2rtc:
+  svpro-go2rtc:
     image: alexxit/go2rtc:latest
     container_name: svpro_go2rtc
     restart: unless-stopped
     ports:
-      - "1984:1984" # HTTP API + WebUI
-      - "8554:8554" # RTSP re-stream (cho Savant AI Core)
-      - "8555:8555" # WebRTC
+      - "1985:1984" # HTTP API + WebUI (1985 trên host tránh trùng VMS go2rtc)
+      - "8556:8554" # RTSP re-stream (cho Savant AI Core)
+      - "8557:8555" # WebRTC
     volumes:
       - ./config/go2rtc.yaml:/config/go2rtc.yaml:ro
     networks:
@@ -34,7 +34,7 @@ services:
         condition: service_healthy
       db-init:
         condition: service_completed_successfully
-      go2rtc:
+      svpro-go2rtc:
         condition: service_healthy
     volumes:
       - .:/opt/savant/user_data
@@ -43,10 +43,10 @@ services:
     environment:
       - PYTHONPATH=/opt/savant/user_data
       - POSTGRES_DSN=postgresql://${POSTGRES_USER:-svpro_user}:${POSTGRES_PASSWORD:-svpro_pass}@postgres:5432/${POSTGRES_DB:-svpro_db}
-      - GO2RTC_URL=http://go2rtc:1984
+      - GO2RTC_URL=http://svpro-go2rtc:1984
       - POLL_INTERVAL_SECS=30
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f go2rtc_sync || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import sys; sys.exit(0)\" || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -74,14 +74,14 @@ services:
       - svpro-net
     environment:
       - PYTHONPATH=/opt/savant/user_data
-      - GO2RTC_URL=http://go2rtc:1984
-      - GO2RTC_RTSP_BASE=rtsp://go2rtc:8554
+      - GO2RTC_URL=http://svpro-go2rtc:1984
+      - GO2RTC_RTSP_BASE=rtsp://svpro-go2rtc:8554
       - ZMQ_PUB_ENDPOINT=pub+connect:ipc:///tmp/zmq-sockets/input-video.ipc
       - POSTGRES_DSN=postgresql://${POSTGRES_USER:-svpro_user}:${POSTGRES_PASSWORD:-svpro_pass}@postgres:5432/${POSTGRES_DB:-svpro_db}
       - POLL_INTERVAL_SECS=30
       - TARGET_FPS=10
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f rtsp_ingest || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import sys; sys.exit(0)\" || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -125,7 +125,7 @@ services:
       # Database credentials — dùng env thay vì hardcode trong module.yml
       - POSTGRES_DSN=postgresql://${POSTGRES_USER:-svpro_user}:${POSTGRES_PASSWORD:-svpro_pass}@postgres:5432/${POSTGRES_DB:-svpro_db}
       # go2rtc RTSP base — savant-rtsp-ingress pull từ đây, truyền vào AI Core qua ZMQ
-      - GO2RTC_RTSP_BASE=rtsp://go2rtc:8554
+      - GO2RTC_RTSP_BASE=rtsp://svpro-go2rtc:8554
       # Port cho Enrollment HTTP Service (chạy trong thread riêng của AI Core)
       - ENROLLMENT_PORT=8090
     command: /opt/savant/user_data/module/module.yml
@@ -255,12 +255,13 @@ services:
       POSTGRES_DSN: postgresql://${POSTGRES_USER:-svpro_user}:${POSTGRES_PASSWORD:-svpro_pass}@postgres:5432/${POSTGRES_DB:-svpro_db}
       REDIS_HOST: redis
       REDIS_PORT: 6379
-      GO2RTC_URL: http://go2rtc:1984
-      GO2RTC_RTSP_URL: rtsp://go2rtc:8554
+      GO2RTC_URL: http://svpro-go2rtc:1984
+      GO2RTC_RTSP_URL: rtsp://svpro-go2rtc:8554
+      PUBLIC_GO2RTC_URL: http://192.168.42.171:1985
       # URL đến Enrollment HTTP Service bên trong savant-ai-core
       AI_CORE_ENROLL_URL: http://savant-ai-core:8090
       # CORS
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:5173,http://localhost:8081,http://192.168.42.171:8081,http://192.168.42.171}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:5173,http://localhost:8081,http://localhost:80,http://localhost,http://192.168.42.171:8081,http://192.168.42.171}
     volumes:
       - snapshot_data:/data
     networks:

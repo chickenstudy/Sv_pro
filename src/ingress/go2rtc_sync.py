@@ -11,8 +11,8 @@ Chức năng:
 
 go2rtc tự xử lý:
   - RTSP reconnect khi camera drop (không cần EOS guard thủ công).
-  - Expose RTSP re-stream tại rtsp://go2rtc:8554/{source_id} cho Savant.
-  - Expose WebRTC/HLS tại http://go2rtc:1984 cho browser.
+  - Expose RTSP re-stream tại rtsp://svpro-go2rtc:8554/{source_id} cho Savant.
+  - Expose WebRTC/HLS tại http://svpro-go2rtc:1984 cho browser.
 
 Khởi chạy:
   python -m src.ingress.go2rtc_sync
@@ -39,7 +39,7 @@ log = logging.getLogger("go2rtc-sync")
 
 # ── Config từ env ──────────────────────────────────────────────────────────────
 DB_DSN        = os.environ.get("POSTGRES_DSN", "postgresql://svpro_user:svpro_pass@postgres:5432/svpro_db")
-GO2RTC_URL    = os.environ.get("GO2RTC_URL", "http://go2rtc:1984")
+GO2RTC_URL    = os.environ.get("GO2RTC_URL", "http://svpro-go2rtc:1984")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECS", "30"))
 CHANNEL       = "cameras_changed"
 
@@ -67,20 +67,29 @@ class CameraRow:
     source_id: str
     enabled:   bool
 
+    @staticmethod
+    def make(row: tuple) -> "CameraRow":
+        """Build from (id, name, rtsp_url, enabled) tuple."""
+        row_id, row_name, row_rtsp, row_enabled = row
+        sid = f"cam_{row_id}"
+        return CameraRow(id=row_id, name=row_name, rtsp_url=row_rtsp, source_id=sid, enabled=row_enabled)
+
 
 def fetch_cameras(dsn: str) -> list[CameraRow]:
-    """Lấy danh sách camera enabled từ PostgreSQL."""
+    """Lấy danh sách camera enabled từ PostgreSQL.
+
+    source_id luôn là 'cam_{id}' — đảm bảo mỗi camera có stream name DUY NHẤT,
+    bất kể name có trùng nhau hay không.
+    """
     try:
         conn = psycopg2.connect(dsn)
         conn.autocommit = True
         cur = conn.cursor()
         cur.execute(
-            "SELECT id, name, rtsp_url, "
-            "COALESCE(name, 'cam_' || id::text) AS source_id, "
-            "enabled "
+            "SELECT id, name, rtsp_url, enabled "
             "FROM cameras ORDER BY id"
         )
-        rows = [CameraRow(*r) for r in cur.fetchall()]
+        rows = [CameraRow.make(r) for r in cur.fetchall()]
         cur.close()
         conn.close()
         return rows
@@ -95,7 +104,7 @@ def sync_to_go2rtc(cameras: list[CameraRow], client: httpx.Client) -> None:
 
     go2rtc API:
       PUT    /api/streams?name={source_id}  body=rtsp_url  → thêm/cập nhật stream
-      DELETE /api/streams?name={source_id}                 → xóa stream
+      DELETE /api/streams?src={source_id}                 → xóa stream
     """
     try:
         resp = client.get(f"{GO2RTC_URL}/api/streams")
@@ -108,18 +117,20 @@ def sync_to_go2rtc(cameras: list[CameraRow], client: httpx.Client) -> None:
     desired_ids = set()
 
     for cam in cameras:
-        if not cam.enabled or not cam.rtsp_url:
-            continue
-        desired_ids.add(cam.source_id)
-        try:
-            client.put(
-                f"{GO2RTC_URL}/api/streams",
-                params={"name": cam.source_id},
-                content=cam.rtsp_url,
-            ).raise_for_status()
-            log.info("✅ Synced [%s] → %s", cam.source_id, cam.rtsp_url[:60])
-        except Exception as exc:
-            log.error("Failed to add stream [%s]: %s", cam.source_id, exc)
+            if not cam.enabled or not cam.rtsp_url:
+                continue
+            desired_ids.add(cam.source_id)
+            try:
+                resp = client.put(
+                    f"{GO2RTC_URL}/api/streams",
+                    params={"name": cam.source_id},
+                    content=cam.rtsp_url.encode(),
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                )
+                resp.raise_for_status()
+                log.info("✅ Synced [%s] → %s", cam.source_id, cam.rtsp_url[:60])
+            except Exception as exc:
+                log.error("Failed to add stream [%s]: %s", cam.source_id, exc)
 
     # Xóa streams không còn trong DB hoặc bị disabled
     for stream_name in list(existing.keys()):
@@ -127,7 +138,7 @@ def sync_to_go2rtc(cameras: list[CameraRow], client: httpx.Client) -> None:
             try:
                 client.delete(
                     f"{GO2RTC_URL}/api/streams",
-                    params={"name": stream_name},
+                    params={"src": stream_name},
                 ).raise_for_status()
                 log.info("🗑️  Removed [%s] from go2rtc", stream_name)
             except Exception as exc:

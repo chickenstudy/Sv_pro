@@ -8,7 +8,7 @@ Endpoints:
   POST /api/events/ingest          — AI Core gửi kết quả nhận diện (API Key)
 """
 
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, date, timezone, timedelta
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -85,25 +85,37 @@ async def list_events(
         f"LIMIT ${len(conditions)+1} OFFSET ${len(conditions)+2}",
         *params,
     )
+    if rows is None:
+        return []
     return [dict(r) for r in rows]
 
 
 @router.get("/stats", summary="Thống kê sự kiện hôm nay")
 async def event_stats(db=Depends(get_db), _=Depends(require_jwt)):
     """Tóm tắt số lượng sự kiện cảnh báo hôm nay theo severity và camera."""
-    today = datetime.now(_VN_TZ).strftime("%Y-%m-%d")
-    by_severity = await db.fetch(
-        "SELECT severity, COUNT(*) AS count FROM access_events "
-        "WHERE event_timestamp::date = $1 GROUP BY severity", today,
-    )
-    by_camera = await db.fetch(
-        "SELECT camera_id, COUNT(*) AS count FROM access_events "
-        "WHERE event_timestamp::date = $1 GROUP BY camera_id ORDER BY count DESC LIMIT 10", today,
-    )
-    total = await db.fetchval("SELECT COUNT(*) FROM access_events WHERE event_timestamp::date=$1", today)
+    today = datetime.now(_VN_TZ).date()
+    today_str = today.isoformat()
+    try:
+        by_severity = await db.fetch(
+            "SELECT severity, COUNT(*) AS count FROM access_events "
+            "WHERE event_timestamp::date = $1 GROUP BY severity", today,
+        )
+    except Exception:
+        by_severity = []
+    try:
+        by_camera = await db.fetch(
+            "SELECT camera_id, COUNT(*) AS count FROM access_events "
+            "WHERE event_timestamp::date = $1 GROUP BY camera_id ORDER BY count DESC LIMIT 10", today,
+        )
+    except Exception:
+        by_camera = []
+    try:
+        total = await db.fetchval("SELECT COUNT(*) FROM access_events WHERE event_timestamp::date=$1", today)
+    except Exception:
+        total = 0
     return {
-        "date":        today,
-        "total":       total,
+        "date":        today_str,
+        "total":       total or 0,
         "by_severity": {r["severity"]: r["count"] for r in by_severity},
         "top_cameras": [{"camera_id": r["camera_id"], "count": r["count"]} for r in by_camera],
     }

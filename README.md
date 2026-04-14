@@ -65,12 +65,12 @@ Camera RTSP (IP: 192.168.x.xxx)
        │       │                           │
        ▼       ▼                           ▼
             ┌────────────────────────────────┐
-            │   go2rtc (RTSP Broker)         │
+            │   svpro-go2rtc (RTSP Broker)         │
             │   Port 1984: HTTP API + WebUI  │ ← go2rtc_sync.py
             │   Port 8554: RTSP re-stream    │   (PG NOTIFY → REST API)
             │   Port 8555: WebRTC (browser)  │
             └────────────────────────────────┘
-                    │ rtsp://go2rtc:8554/{cam_id}
+                    │ svpro-go2rtc:8554/{cam_id}
                     ▼
             ┌────────────────────────────────┐
             │  savant-rtsp-ingress           │
@@ -110,8 +110,8 @@ Camera RTSP (IP: 192.168.x.xxx)
 |------|-----------|---------|
 | GPU Inference | NVIDIA DeepStream 7.x + TensorRT FP16 | Decode H.264/H.265 NVDEC + chạy model AI trên GPU |
 | AI Framework | Savant (insight-platform) | Pipeline manager, ZMQ IPC, PyFunc plugin system |
-| RTSP Broker | **go2rtc** | Nhận RTSP từ IP camera, re-stream cho Savant Ingress + WebRTC browser |
-| Camera Sync | go2rtc_sync.py + PG NOTIFY | Đồng bộ camera DB → go2rtc REST API realtime |
+| RTSP Broker | **svpro-go2rtc** | Nhận RTSP từ IP camera, re-stream cho Savant Ingress + WebRTC browser |
+| Camera Sync | go2rtc_sync.py + PG NOTIFY | Đồng bộ camera DB → svpro-go2rtc REST API realtime |
 | RTSP Ingress | rtsp_ingest.py (savant-rtsp-ingress) | Pull RTSP từ go2rtc → push ZMQ frames vào Savant AI Core |
 | Person/Vehicle Det. | YOLOv8s (TensorRT) | Tầng 1: phát hiện người & xe trên full frame |
 | Face Detection | SCRFD-10GF (ONNX Runtime) | 5-point landmark, face alignment trước ArcFace |

@@ -29,10 +29,15 @@ router = APIRouter()
 logger = logging.getLogger("stream")
 
 # ── go2rtc config ─────────────────────────────────────────────────────────────
-GO2RTC_URL      = os.environ.get("GO2RTC_URL", "http://go2rtc:1984")
-GO2RTC_RTSP_URL = os.environ.get("GO2RTC_RTSP_URL", "rtsp://go2rtc:8554")
+# Internal URL — backend gọi go2rtc bên trong Docker network
+GO2RTC_URL      = os.environ.get("GO2RTC_URL", "http://svpro-go2rtc:1984")
+GO2RTC_RTSP_URL = os.environ.get("GO2RTC_RTSP_URL", "rtsp://svpro-go2rtc:8554")
 
-# HTTP client để gọi go2rtc API
+# Public URL — trả cho browser/máy khác kết nối trực tiếp go2rtc
+# Fallback = GO2RTC_URL (cùng máy chủ, Docker internal network)
+GO2RTC_PUBLIC_URL = os.environ.get("PUBLIC_GO2RTC_URL", GO2RTC_URL)
+
+# HTTP client để gọi go2rtc API (luôn dùng internal URL)
 _go2rtc_client = httpx.AsyncClient(base_url=GO2RTC_URL, timeout=5.0)
 
 # Cache camera config để tránh query DB mỗi request
@@ -56,28 +61,29 @@ async def _get_cached_camera(cam_id: int, db) -> Optional[dict]:
     row = await db.fetchrow(
         "SELECT id, name, rtsp_url, enabled FROM cameras WHERE id=$1", cam_id,
     )
-    if row:
-        _camera_cache[cam_id] = (dict(row), now + _CACHE_TTL_SEC)
-        return _camera_cache[cam_id][0]
-    return None
+    if not row:
+        return None
+    _camera_cache[cam_id] = (dict(row), now + _CACHE_TTL_SEC)
+    return _camera_cache[cam_id][0]
 
 
-def _build_stream_urls(source_id: str) -> dict:
+def _build_stream_urls(source_id: str, public_base: str) -> dict:
     """
     Trả về các URL stream của go2rtc cho source_id đó.
     Browser có thể dùng WebRTC, HLS hoặc MSE tuỳ player.
+    public_base: base URL dùng cho browser (PUBLIC_GO2RTC_URL).
     """
     return {
         # WebRTC: độ trễ thấp nhất (~200ms)
-        "webrtc":     f"{GO2RTC_URL}/webrtc?src={source_id}",
+        "webrtc":     f"{public_base}/webrtc?src={source_id}",
         # HLS: tương thích rộng nhất (Safari, iOS)
-        "hls":        f"{GO2RTC_URL}/stream.m3u8?src={source_id}",
+        "hls":        f"{public_base}/stream.m3u8?src={source_id}",
         # MSE (Media Source Extensions): Chrome/Firefox, latency thấp hơn HLS
-        "mse":        f"{GO2RTC_URL}/stream.mp4?src={source_id}",
-        # RTSP re-stream: cho các client RTSP khác (VLC, Savant)
+        "mse":        f"{public_base}/stream.mp4?src={source_id}",
+        # RTSP re-stream: cho các client RTSP khác (VLC, Savant) — dùng internal
         "rtsp":       f"{GO2RTC_RTSP_URL}/{source_id}",
         # go2rtc player UI
-        "player_ui":  f"{GO2RTC_URL}/?src={source_id}",
+        "player_ui":  f"{public_base}/?src={source_id}",
     }
 
 
@@ -99,7 +105,7 @@ async def stream_info(cam_id: int, db=Depends(get_db), _=Depends(require_jwt)):
     return {
         "camera_id": cam_id,
         "source_id": source_id,
-        "urls":      _build_stream_urls(source_id),
+        "urls":      _build_stream_urls(source_id, GO2RTC_PUBLIC_URL),
     }
 
 
@@ -132,7 +138,7 @@ async def stream_status(cam_id: int, db=Depends(get_db), _=Depends(require_jwt))
         "active":      is_active,
         "producers":   len(producers),   # Nguồn input (RTSP camera)
         "consumers":   len(consumers),   # Số client đang xem
-        "urls":        _build_stream_urls(source_id) if is_active else {},
+        "urls":        _build_stream_urls(source_id, GO2RTC_PUBLIC_URL) if is_active else {},
     }
 
 
@@ -154,7 +160,7 @@ async def list_active_streams(_=Depends(require_jwt)):
                 "source_id": name,
                 "producers": len(data.get("producers", [])),
                 "consumers": len(data.get("consumers", [])),
-                "urls":      _build_stream_urls(name),
+                "urls":      _build_stream_urls(name, GO2RTC_PUBLIC_URL),
             }
             for name, data in streams.items()
         ],

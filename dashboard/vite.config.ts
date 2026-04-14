@@ -18,7 +18,7 @@ export default defineConfig({
       },
       // Proxy go2rtc API để lấy stream info
       '/go2rtc-api': {
-        target: 'http://localhost:1984',
+        target: 'http://localhost:1985',
         changeOrigin: true,
         rewrite: (path: string) => path.replace(/^\/go2rtc-api/, ''),
       },

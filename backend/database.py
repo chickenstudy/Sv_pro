@@ -54,6 +54,12 @@ async def get_db():
             async def fetchval(self, *_args, **_kwargs):
                 return 1
 
+            async def fetch(self, *_args, **_kwargs):
+                return []
+
+            async def fetchrow(self, *_args, **_kwargs):
+                return None
+
         yield _DummyConn()
         return
 

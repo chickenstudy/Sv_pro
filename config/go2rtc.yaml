@@ -12,7 +12,7 @@ api:
 
 # ── RTSP Server (re-stream cho Savant AI Core) ────────────────────────────────
 rtsp:
-  listen: ":8554"    # Savant đọc RTSP từ go2rtc tại rtsp://go2rtc:8554/{source_id}
+  listen: ":8554"    # Savant đọc RTSP từ svpro-go2rtc tại rtsp://svpro-go2rtc:8554/{source_id}
 
 # ── WebRTC (Browser stream trực tiếp, không qua backend FFmpeg) ───────────────
 webrtc:

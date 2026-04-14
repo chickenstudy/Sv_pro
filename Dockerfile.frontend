@@ -16,7 +16,7 @@ COPY dashboard/tsconfig.json ./
 COPY dashboard/tsconfig.node.json ./
 
 ENV VITE_API_URL=
-ENV VITE_GO2RTC_URL=http://go2rtc:1984
+ENV VITE_GO2RTC_URL=
 RUN npm run build
 
 # Stage 2: Serve with nginx

@@ -3,7 +3,7 @@ RTSP Ingest — SV-PRO (go2rtc → Savant ZMQ Bridge).
 
 Chức năng:
   - Truy vấn go2rtc /api/streams để lấy danh sách camera active.
-  - Với mỗi camera: kéo RTSP từ go2rtc (rtsp://go2rtc:8554/{source_id}).
+  - Với mỗi camera: kéo RTSP từ svpro-go2rtc (rtsp://svpro-go2rtc:8554/{source_id}).
   - Encode frame → push vào Savant AI Core qua ZMQ PUB socket.
   - Lắng nghe PG NOTIFY để cập nhật ngay khi camera thay đổi.
   - Fallback poll mỗi POLL_INTERVAL giây.
@@ -43,8 +43,8 @@ logging.basicConfig(
 log = logging.getLogger("rtsp-ingest")
 
 # ── Config từ env ──────────────────────────────────────────────────────────────
-GO2RTC_URL        = os.environ.get("GO2RTC_URL", "http://go2rtc:1984")
-GO2RTC_RTSP_BASE  = os.environ.get("GO2RTC_RTSP_BASE", "rtsp://go2rtc:8554")
+GO2RTC_URL        = os.environ.get("GO2RTC_URL", "http://svpro-go2rtc:1984")
+GO2RTC_RTSP_BASE  = os.environ.get("GO2RTC_RTSP_BASE", "rtsp://svpro-go2rtc:8554")
 ZMQ_PUB_ENDPOINT  = os.environ.get("ZMQ_PUB_ENDPOINT", "pub+connect:ipc:///tmp/zmq-sockets/input-video.ipc")
 DB_DSN            = os.environ.get("POSTGRES_DSN", "postgresql://svpro_user:svpro_pass@postgres:5432/svpro_db")
 POLL_INTERVAL     = int(os.environ.get("POLL_INTERVAL_SECS", "30"))
@@ -194,14 +194,17 @@ class StreamManager:
                 worker = StreamWorker(config=cfg)
                 worker.start(self._zmq_publisher)
                 self._workers[sid] = worker
+                log.info("📹 Worker added for stream: [%s]", sid)
 
             # Dừng worker cho stream đã xóa
             for sid in current - desired:
+                log.info("📹 Worker removed for stream: [%s]", sid)
                 self._workers[sid].stop()
                 del self._workers[sid]
 
-        log.info("Streams: %d active | added=%d removed=%d",
-                 len(desired), len(desired - current), len(current - desired))
+        log.info("Streams: %d active | added=%d removed=%d | streams=%s",
+                 len(desired), len(desired - current), len(current - desired),
+                 list(desired))
 
     def stop_all(self) -> None:
         """Dừng tất cả worker khi shutdown."""
@@ -215,18 +218,30 @@ class StreamManager:
 
 def fetch_active_streams(client: httpx.Client) -> dict[str, str]:
     """
-    Lấy danh sách streams đang active từ go2rtc API.
+    Lấy danh sách streams đã đăng ký với go2rtc.
 
-    Trả về {source_id: rtsp_url} — rtsp_url là URL re-stream của go2rtc.
+    Trả về {source_id: rtsp_url} cho mọi stream go2rtc biết (không filter producers).
+    StreamWorker sẽ tự retry kết nối nếu camera chưa online — không cần đợi ở đây.
+
+    go2rtc tự động:
+      - Connect RTSP source khi có PUT /api/streams
+      - Reconnect khi camera drop
+      - Expose re-stream tại rtsp://svpro-go2rtc:8554/{source_id} ngay khi đăng ký
     """
     try:
         resp = client.get(f"{GO2RTC_URL}/api/streams", timeout=5.0)
         resp.raise_for_status()
-        streams: dict = resp.json() or {}
+        raw_body = resp.text
+        log.info("go2rtc /api/streams raw response: %s", raw_body[:500])
+        raw = json.loads(raw_body) if raw_body.strip() else {}
+        streams: dict = raw if isinstance(raw, dict) else {}
+        if streams:
+            log.info("go2rtc streams: %s", streams)
+        else:
+            log.warning("go2rtc /api/streams returned empty — raw: %s", raw_body[:200])
         return {
             sid: f"{GO2RTC_RTSP_BASE}/{sid}"
             for sid, data in streams.items()
-            if data and data.get("producers")   # Chỉ stream đang có nguồn input
         }
     except Exception as exc:
         log.error("Cannot reach go2rtc API: %s", exc)
@@ -246,6 +261,31 @@ def wait_for_go2rtc(client: httpx.Client, max_retries: int = 30) -> bool:
         log.info("Waiting for go2rtc... (%d/%d)", attempt + 1, max_retries)
         time.sleep(2)
     return False
+
+
+def _wait_for_streams(client: httpx.Client, timeout_sec: int = 90) -> list[str]:
+    """
+    Chờ cho đến khi go2rtc có ít nhất 1 stream đăng ký.
+    Retry ngắn (2s) trong timeout_sec giây — tránh race với go2rtc-sync.
+    """
+    deadline = time.monotonic() + timeout_sec
+    attempt = 0
+    while time.monotonic() < deadline:
+        attempt += 1
+        try:
+            resp = client.get(f"{GO2RTC_URL}/api/streams", timeout=5.0)
+            resp.raise_for_status()
+            streams: dict = resp.json() or {}
+            names = list(streams.keys())
+            if names:
+                log.info("Found %d stream(s) in go2rtc: %s", len(names), names)
+                return names
+            log.info("Waiting for streams to appear in go2rtc... (attempt %d)", attempt)
+        except Exception as exc:
+            log.warning("Error polling streams (attempt %d): %s", attempt, exc)
+        time.sleep(2)
+    log.warning("Timeout waiting for streams — will sync on next poll cycle")
+    return []
 
 
 # ── PG NOTIFY loop ─────────────────────────────────────────────────────────────
@@ -345,6 +385,9 @@ def main():
     if not wait_for_go2rtc(http_client):
         log.error("go2rtc not available after retries — exiting.")
         sys.exit(1)
+
+    # Chờ streams xuất hiện trong go2rtc (tránh race với go2rtc-sync startup)
+    _wait_for_streams(http_client)
 
     zmq_pub = _init_zmq()
     manager = StreamManager(zmq_publisher=zmq_pub)
