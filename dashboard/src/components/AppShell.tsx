@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import {
   LayoutDashboard,
@@ -6,15 +6,18 @@ import {
   Users,
   UserX,
   Car,
-  DoorOpen,
   Activity,
   BellRing,
   LogOut,
   ChevronLeft,
   ChevronRight,
-  Target
+  Target,
+  User as UserIcon,
+  Shield,
+  Settings as SettingsIcon,
 } from 'lucide-react'
-import { clearToken } from '../api'
+import useSWR from 'swr'
+import { clearToken, authApi } from '../api'
 
 // ── Shared Config ─────────────────────────────────────────────────────────────
 
@@ -24,20 +27,20 @@ const NAV_ITEMS = [
   { path: '/users', icon: Users, label: 'Danh tính' },
   { path: '/strangers', icon: UserX, label: 'Người lạ' },
   { path: '/vehicles', icon: Car, label: 'Phương tiện' },
-  { path: '/doors', icon: DoorOpen, label: 'Điều khiển Cửa' },
   { path: '/events', icon: Activity, label: 'Sự kiện Access' },
   { path: '/alerts', icon: BellRing, label: 'Cảnh báo' },
+  { path: '/settings', icon: SettingsIcon, label: 'Cài đặt' },
 ]
 
 const PAGE_TITLES: Record<string, string> = {
   '/': 'Tổng quan hệ thống',
   '/cameras': 'Quản lý Camera',
-  '/users': 'Quản lý Danh tính (Users)',
+  '/users': 'Danh tính + Khuôn mặt',
   '/strangers': 'Theo dõi Người lạ (Strangers)',
   '/vehicles': 'Quản lý Phương tiện (LPR)',
-  '/doors': 'Quản lý Cửa (Access Control)',
   '/events': 'Sự kiện Access Control',
   '/alerts': 'Lịch sử Cảnh báo',
+  '/settings': 'Cài đặt hệ thống',
 }
 
 // ── AppShell Component (Layout chính) ────────────────────────────────────────
@@ -82,6 +85,7 @@ export default function AppShell({ onLogout }: { onLogout: () => void }) {
             }}>
               Live System
             </span>
+            <UserMenu onLogout={handleLogout} />
           </div>
         </header>
 
@@ -152,5 +156,92 @@ function Sidebar({ collapsed, onCollapse, onLogout }: {
         </button>
       </div>
     </aside>
+  )
+}
+
+// ── UserMenu (topbar) ────────────────────────────────────────────────────────
+
+function UserMenu({ onLogout }: { onLogout: () => void }) {
+  const { data: me } = useSWR('/api/auth/me', authApi.me, {
+    shouldRetryOnError: false,
+    refreshInterval: 0,
+  })
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const onDoc = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', onDoc)
+    return () => document.removeEventListener('mousedown', onDoc)
+  }, [])
+
+  const role = (me as any)?.role || 'user'
+  const username = me?.username || '...'
+  const RoleIcon = role === 'admin' ? Shield : UserIcon
+
+  return (
+    <div ref={ref} style={{ position: 'relative' }}>
+      <button
+        className="btn btn--ghost"
+        style={{
+          padding: '4px 10px',
+          display: 'flex', alignItems: 'center', gap: 6,
+          fontSize: 12,
+        }}
+        onClick={() => setOpen(o => !o)}
+      >
+        <div style={{
+          width: 22, height: 22, borderRadius: '50%',
+          background: 'var(--brand)', color: '#fff',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          fontSize: 11, fontWeight: 700,
+        }}>
+          {(username[0] || '?').toUpperCase()}
+        </div>
+        <span style={{ fontWeight: 600 }}>{username}</span>
+        <span className="badge badge--brand" style={{ display: 'inline-flex', alignItems: 'center', gap: 3, fontSize: 10 }}>
+          <RoleIcon size={9} /> {role}
+        </span>
+      </button>
+
+      {open && (
+        <div
+          style={{
+            position: 'absolute', top: 'calc(100% + 6px)', right: 0,
+            minWidth: 180,
+            background: 'var(--bg-elevated)',
+            border: '1px solid var(--border)',
+            borderRadius: 'var(--r-md)',
+            boxShadow: '0 8px 16px rgba(0,0,0,0.2)',
+            zIndex: 100,
+            overflow: 'hidden',
+          }}
+        >
+          <div style={{
+            padding: '10px 12px',
+            borderBottom: '1px solid var(--border)',
+          }}>
+            <div style={{ fontSize: 12, fontWeight: 600 }}>{username}</div>
+            <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>Role: {role}</div>
+          </div>
+          <button
+            onClick={() => { setOpen(false); onLogout() }}
+            style={{
+              width: '100%', padding: '8px 12px',
+              background: 'none', border: 'none', cursor: 'pointer',
+              display: 'flex', alignItems: 'center', gap: 8,
+              fontSize: 12, color: 'var(--danger)',
+              textAlign: 'left',
+            }}
+            onMouseEnter={e => (e.currentTarget.style.background = 'var(--bg)')}
+            onMouseLeave={e => (e.currentTarget.style.background = 'none')}
+          >
+            <LogOut size={14} /> Đăng xuất
+          </button>
+        </div>
+      )}
+    </div>
   )
 }

@@ -1,7 +1,8 @@
 import { useState, useRef } from 'react'
 import useSWR from 'swr'
 import { camerasApi, type Camera } from '../api'
-import { Camera as CameraIcon, Plus, X, Save, Clock, HelpCircle, Pencil, Trash2 } from 'lucide-react'
+import { Camera as CameraIcon, Plus, X, Save, Clock, HelpCircle, Pencil, Trash2, Eraser } from 'lucide-react'
+import RoiEditor from '../components/RoiEditor'
 
 const AI_MODE_OPTIONS = [
   { value: 'both', label: 'LPR + FR' },
@@ -35,6 +36,7 @@ export default function CamerasPage() {
   const [saving, setSaving] = useState(false)
   const [formError, setFormError] = useState('')
   const [deleting, setDeleting] = useState<number | null>(null)
+  const [roiCamera, setRoiCamera] = useState<Camera | null>(null)
 
   const handleOpenCreate = () => {
     setForm(BLANK)
@@ -276,6 +278,16 @@ export default function CamerasPage() {
                           <Pencil size={13} />
                         </button>
                         <button
+                          className={`btn btn--sm ${cam.roi_polygon && cam.roi_polygon.length >= 3 ? 'btn--primary' : 'btn--ghost'}`}
+                          onClick={() => setRoiCamera(cam)}
+                          title={cam.roi_polygon && cam.roi_polygon.length >= 3
+                            ? `ROI: ${cam.roi_polygon.length} điểm — click để sửa`
+                            : 'Vẽ ROI vùng quan tâm'}
+                          disabled={!cam.enabled}
+                        >
+                          <Eraser size={13} />
+                        </button>
+                        <button
                           className="btn btn--sm"
                           style={{ color: 'var(--danger)', borderColor: 'var(--danger)30' }}
                           onClick={() => handleDelete(cam)}
@@ -296,6 +308,14 @@ export default function CamerasPage() {
           )}
         </div>
       </div>
+
+      {roiCamera && (
+        <RoiEditor
+          camera={roiCamera}
+          onSaved={() => { setRoiCamera(null); mutate() }}
+          onClose={() => setRoiCamera(null)}
+        />
+      )}
     </div>
   )
 }

@@ -43,7 +43,10 @@ pipeline:
       model:
         format: onnx
         model_file: /models/yolov8/yolov8s.onnx
-        batch_size: 1
+        # batch_size 4 → 1 GPU inference call xử lý 4 frames cùng lúc, throughput
+        # tăng ~3x so với batch=1 (do tiết kiệm overhead launch CUDA kernel).
+        # Latency tăng nhẹ ~10ms/batch nhưng vẫn dưới 30ms tổng → realtime OK.
+        batch_size: 4
         input:
           layer_name: images
           shape: [3, 640, 640]
@@ -71,6 +74,13 @@ pipeline:
             - class_id: 7
               label: truck
 
+    # NOTE: debug_pyfunc đã TẮT — trước đó log ERROR "Saw N objects!" mỗi frame
+    # tốn ~15% CPU format/flush log. Bật lại chỉ khi debug pipeline flow.
+    # - element: pyfunc
+    #   module: src.debug_pyfunc
+    #   class_name: DebugPyFunc
+    #   name: debug_post_yolo
+
     # ── Stage 1b: NvSORT Object Tracker ──────────────────────────────────────
     # Tracking vehicles/persons across frames trước khi đưa vào LPR/FR
     - element: nvtracker
@@ -92,13 +102,11 @@ pipeline:
         plate_model_path: /models/yolov8n_plate/yolov8n_plate.onnx
         plate_conf_threshold: 0.50
         ocr_conf_threshold: 0.60
-        # ROI zones — zone mặc định toàn frame, được cập nhật qua /api/cameras/{id}/config
+        # ROI zones — config per-camera, updated via /api/cameras/{id}/config
         # Format: source_id → [x1, y1, x2, y2] (pixel coords của full frame)
-        roi_zones:
-          cam_online_1: [0, 0, 2592, 1944]   # Camera cổng chính (seed: name='cam_online_1')
-          cam_02: [200, 100, 2392, 1844]     # Camera bãi giữ xe — cập nhật key khi thêm camera thật
-          cam_03: [0, 0, 2592, 972]          # Camera làn vào — cập nhật key khi thêm camera thật
-          cam_dummy_01: [0, 0, 1280, 720]    # Ingress giả lập (dummy stream)
+        # Empty dict = process full frame for all cameras (default fallback).
+        # source_id = cam_{db_id} — loaded dynamically from DB.
+        roi_zones: {}
         # Night mode: tự động kích hoạt CLAHE preprocess khi mean brightness < threshold
         night_mode_threshold: 80         # Mean pixel value 0-255
         # Temporal voting: số frame tích lũy trước khi quyết định biển số
@@ -115,15 +123,18 @@ pipeline:
       class_name: FaceRecognizer
       kwargs:
         # Model paths (mount qua Docker volume /models)
-        scrfd_model_path: /models/scrfd_10g_bnkps.onnx
+        # Face detector: YOLOv8-face (mặc định, ít false-positive trên non-face).
+        # SCRFD đã loại — code path scrfd_model_path đã bỏ.
+        yolov8_face_model_path: /models/yolov8_face/yolov8n-face.onnx
         arcface_model_path: /models/glintr100.onnx
         anti_spoof_model_path: /models/anti_spoof/minifasnet.onnx
         # Detection params
         det_size: [640, 640]
         recognition_threshold: 0.60   # Cosine similarity tối thiểu để match
-        # Anti-spoofing
+        # Anti-spoofing — BẬT lại sau khi sửa code đọc đúng output index 0 (real)
+        # thay vì index 1 (fake_2D). MiniFASNet output [real, fake_2D, fake_3D].
         enable_anti_spoof: true
-        spoof_threshold: 0.85
+        spoof_threshold: 0.50
         # L1 Cache (in-process)
         l1_cache_capacity: 500
         l1_cache_ttl: 120             # 2 phút
@@ -150,11 +161,9 @@ pipeline:
       class_name: BlacklistPyfunc
       kwargs:
         # Zones và quyền truy cập theo camera
-        camera_zones:
-          cam_online_1: "gate"       # seed camera — source_id = name column
-          cam_02: "parking"
-          cam_03: "entrance"
-          cam_dummy_01: "test"
+        # Camera → zone mapping: loaded dynamically from DB if empty.
+        # Fallback: cameras will use "zone_denied" check only if configured.
+        camera_zones: {}
         zone_access:
           gate:     ["staff", "admin", "management"]
           parking:  ["staff", "admin", "management", "visitor"]

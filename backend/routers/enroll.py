@@ -37,10 +37,23 @@ _AI_CORE_ENROLL_URL = os.environ.get(
 )
 _ENROLL_ENDPOINT    = f"{_AI_CORE_ENROLL_URL}/internal/enroll"
 _HEALTH_ENDPOINT    = f"{_AI_CORE_ENROLL_URL}/internal/health"
+_RELOAD_ENDPOINT    = f"{_AI_CORE_ENROLL_URL}/internal/reload-embeddings"
 _TIMEOUT_SEC        = 30.0   # Enroll có thể chậm hơn bình thường (TensorRT warmup)
 
 # HTTP client dùng chung (connection pooling)
 _http_client = httpx.AsyncClient(timeout=_TIMEOUT_SEC)
+
+
+async def _trigger_reload_embeddings() -> None:
+    """
+    Gọi AI core reload Redis hash + L1 cache sau khi enroll/update.
+    Fire-and-forget — nếu fail (AI core down) cũng không chặn enrollment;
+    Redis TTL 5 phút sẽ tự reload sau cùng.
+    """
+    try:
+        await _http_client.post(_RELOAD_ENDPOINT, timeout=3.0)
+    except Exception as exc:
+        logger.warning("Reload embeddings call failed (will fallback to TTL): %s", exc)
 
 
 # ── Helper: gọi AI Core để lấy embedding ─────────────────────────────────────
@@ -145,6 +158,7 @@ async def enroll_face_from_image(
     embedding = await _get_embedding_from_ai_core(contents, file.filename or "image.jpg")
     await _save_embedding(user_id, embedding, db)
     _invalidate_redis(user_id)
+    await _trigger_reload_embeddings()   # AI core re-prefetch + clear L1 → match liền
 
     logger.info("Face enrolled for user_id=%s name=%s via AI Core", user_id, row["name"])
     return {
@@ -207,6 +221,7 @@ async def enroll_faces_multi(
 
     await _save_embedding(user_id, mean_emb.tolist(), db)
     _invalidate_redis(user_id)
+    await _trigger_reload_embeddings()   # AI core re-prefetch + clear L1 → match liền
 
     return {
         "success":        True,
@@ -242,6 +257,7 @@ async def delete_face_enrollment(
         return {"success": False, "message": "Người dùng này chưa có dữ liệu khuôn mặt"}
 
     _invalidate_redis(user_id)
+    await _trigger_reload_embeddings()   # AI core re-prefetch sau khi xóa
     return {"success": True, "user_id": user_id, "name": row["name"],
             "message": f"Đã xóa dữ liệu khuôn mặt của {row['name']}."}
 

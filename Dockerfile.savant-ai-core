@@ -22,4 +22,4 @@ RUN /opt/venv/bin/pip install --no-cache-dir paddlepaddle-gpu==2.6.2 \
         && /opt/venv/bin/pip install --no-cache-dir "paddleocr>=2.7,<3"
 
 RUN /opt/venv/bin/pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python 2>/dev/null || true \
-        && /opt/venv/bin/pip install --no-cache-dir "numpy>=1.22.4,<2" "click>=8.1.6,<8.2"
+        && /opt/venv/bin/pip install --no-cache-dir "numpy>=1.22.4,<2" "click>=8.1.6,<8.2" "pyzmq>=24.0.0"

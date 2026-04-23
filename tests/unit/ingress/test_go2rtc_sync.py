@@ -102,7 +102,7 @@ class TestSyncToGo2rtc:
         mock_put_resp.raise_for_status = MagicMock()
         mock_client.put.return_value = mock_put_resp
 
-        with patch("src.ingress.go2rtc_sync.GO2RTC_URL", "http://svpro-go2rtc:1984"):
+        with patch("src.ingress.go2rtc_sync.GO2RTC_URL", "http://go2rtc:1984"):
             sync_to_go2rtc(cameras, mock_client)
 
         mock_client.put.assert_called_once()
@@ -119,7 +119,7 @@ class TestSyncToGo2rtc:
         mock_client = MagicMock()
         mock_client.get.return_value = MagicMock(status_code=200, json=lambda: {})
 
-        with patch("src.ingress.go2rtc_sync.GO2RTC_URL", "http://svpro-go2rtc:1984"):
+        with patch("src.ingress.go2rtc_sync.GO2RTC_URL", "http://go2rtc:1984"):
             sync_to_go2rtc(cameras, mock_client)
 
         mock_client.put.assert_not_called()
@@ -136,7 +136,7 @@ class TestSyncToGo2rtc:
         mock_client.put.return_value = MagicMock(raise_for_status=MagicMock())
         mock_client.delete.return_value = MagicMock(raise_for_status=MagicMock())
 
-        with patch("src.ingress.go2rtc_sync.GO2RTC_URL", "http://svpro-go2rtc:1984"):
+        with patch("src.ingress.go2rtc_sync.GO2RTC_URL", "http://go2rtc:1984"):
             sync_to_go2rtc(cameras, mock_client)
 
         mock_client.delete.assert_called_once()
@@ -153,7 +153,7 @@ class TestSyncToGo2rtc:
         mock_client.get.side_effect = Exception("connection refused")
 
         # Không raise exception
-        with patch("src.ingress.go2rtc_sync.GO2RTC_URL", "http://svpro-go2rtc:1984"):
+        with patch("src.ingress.go2rtc_sync.GO2RTC_URL", "http://go2rtc:1984"):
             sync_to_go2rtc(cameras, mock_client)
 
         mock_client.put.assert_not_called()
@@ -167,7 +167,7 @@ class TestSyncToGo2rtc:
         mock_client = MagicMock()
         mock_client.get.return_value = MagicMock(status_code=200, json=lambda: {})
 
-        with patch("src.ingress.go2rtc_sync.GO2RTC_URL", "http://svpro-go2rtc:1984"):
+        with patch("src.ingress.go2rtc_sync.GO2RTC_URL", "http://go2rtc:1984"):
             sync_to_go2rtc(cameras, mock_client)
 
         mock_client.put.assert_not_called()
@@ -184,7 +184,7 @@ class TestWaitForGo2rtc:
         mock_client = MagicMock()
         mock_client.get.return_value = MagicMock(status_code=200)
 
-        with patch("src.ingress.go2rtc_sync.GO2RTC_URL", "http://svpro-go2rtc:1984"), \
+        with patch("src.ingress.go2rtc_sync.GO2RTC_URL", "http://go2rtc:1984"), \
              patch("time.sleep"):
             result = wait_for_go2rtc(mock_client, max_retries=5)
 
@@ -202,7 +202,7 @@ class TestWaitForGo2rtc:
             MagicMock(status_code=200),
         ]
 
-        with patch("src.ingress.go2rtc_sync.GO2RTC_URL", "http://svpro-go2rtc:1984"), \
+        with patch("src.ingress.go2rtc_sync.GO2RTC_URL", "http://go2rtc:1984"), \
              patch("time.sleep"):
             result = wait_for_go2rtc(mock_client, max_retries=5)
 
@@ -216,7 +216,7 @@ class TestWaitForGo2rtc:
         mock_client = MagicMock()
         mock_client.get.side_effect = Exception("timeout")
 
-        with patch("src.ingress.go2rtc_sync.GO2RTC_URL", "http://svpro-go2rtc:1984"), \
+        with patch("src.ingress.go2rtc_sync.GO2RTC_URL", "http://go2rtc:1984"), \
              patch("time.sleep"):
             result = wait_for_go2rtc(mock_client, max_retries=3)
 
@@ -230,7 +230,7 @@ class TestWaitForGo2rtc:
         mock_client = MagicMock()
         mock_client.get.return_value = MagicMock(status_code=404)
 
-        with patch("src.ingress.go2rtc_sync.GO2RTC_URL", "http://svpro-go2rtc:1984"), \
+        with patch("src.ingress.go2rtc_sync.GO2RTC_URL", "http://go2rtc:1984"), \
              patch("time.sleep"):
             result = wait_for_go2rtc(mock_client, max_retries=3)
 
@@ -243,7 +243,7 @@ class TestWaitForGo2rtc:
         mock_client = MagicMock()
         mock_client.get.return_value = MagicMock(status_code=500)
 
-        with patch("src.ingress.go2rtc_sync.GO2RTC_URL", "http://svpro-go2rtc:1984"), \
+        with patch("src.ingress.go2rtc_sync.GO2RTC_URL", "http://go2rtc:1984"), \
              patch("time.sleep"):
             result = wait_for_go2rtc(mock_client, max_retries=3)
 

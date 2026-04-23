@@ -72,7 +72,8 @@ export const authApi = {
 // ── Events API ────────────────────────────────────────────────────────────────
 
 export interface AccessEvent {
-  id: number
+  // Backend trả ID dạng string (UNION giữa access_events.id INT và recognition_logs.event_id UUID)
+  id: string
   event_type: string
   entity_type: string | null
   entity_id: string | null
@@ -82,6 +83,21 @@ export interface AccessEvent {
   reason: string | null
   event_timestamp: string
   alert_sent: boolean
+  // Đường dẫn tương đối ảnh trong /Detect — FE build URL: /api/detect-images/{image_path}
+  image_path: string | null
+}
+
+/**
+ * URL ảnh detection — backend chấp nhận JWT qua query param ?t=
+ * vì <img src> không thể gắn header Authorization.
+ */
+export function detectImageUrl(rel: string | null | undefined): string | null {
+  if (!rel) return null
+  const safe = rel.split('/').map(encodeURIComponent).join('/')
+  const tok = getToken()
+  return tok
+    ? `/api/detect-images/${safe}?t=${encodeURIComponent(tok)}`
+    : `/api/detect-images/${safe}`
 }
 
 export interface EventStats {
@@ -109,10 +125,12 @@ export const eventsApi = {
   },
 
   stats: () => apiFetch<EventStats>('/api/events/stats'),
-  get: (id: number) => apiFetch<AccessEvent>(`/api/events/${id}`),
+  get: (id: string | number) => apiFetch<AccessEvent>(`/api/events/${id}`),
 }
 
 // ── Cameras API ───────────────────────────────────────────────────────────────
+
+export interface RoiPoint { x: number; y: number }   // toạ độ chuẩn hoá [0,1]
 
 export interface Camera {
   id: number
@@ -124,6 +142,7 @@ export interface Camera {
   fps_limit: number
   enabled: boolean
   created_at: string
+  roi_polygon: RoiPoint[] | null
 }
 
 export const camerasApi = {
@@ -135,6 +154,14 @@ export const camerasApi = {
     apiFetch<Camera>(`/api/cameras/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   delete: (id: number) =>
     apiFetch<void>(`/api/cameras/${id}`, { method: 'DELETE' }),
+  /** URL ảnh snapshot 1 frame (kèm token) cho ROI editor. */
+  snapshotUrl: (id: number) => {
+    const tok = getToken()
+    const cb  = `_=${Date.now()}`
+    return tok
+      ? `/api/stream/${id}/snapshot?t=${encodeURIComponent(tok)}&${cb}`
+      : `/api/stream/${id}/snapshot?${cb}`
+  },
 }
 
 // ── Users API ─────────────────────────────────────────────────────────────────
@@ -165,6 +192,187 @@ export const usersApi = {
     apiFetch<User>(`/api/users/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   deactivate: (id: number) =>
     apiFetch<void>(`/api/users/${id}`, { method: 'DELETE' }),
+}
+
+// ── Face Enrollment API ───────────────────────────────────────────────────────
+
+export interface EnrollResponse {
+  success: boolean
+  user_id: number
+  name: string
+  message: string
+}
+
+/**
+ * Upload ảnh face để đăng ký cho user. Backend proxy sang AI Core
+ * (SCRFD + ArcFace warmup sẵn) để extract embedding 512-dim, lưu vào
+ * users.face_embedding (pgvector).
+ */
+async function enrollUploadFile(userId: number, file: File): Promise<EnrollResponse> {
+  return enrollUploadMultipart(userId, [file], 'face')
+}
+
+async function enrollUploadFiles(userId: number, files: File[]): Promise<EnrollResponse & { failed?: { file: string; reason: string }[]; succeeded?: number }> {
+  return enrollUploadMultipart(userId, files, 'faces')
+}
+
+async function enrollUploadMultipart(
+  userId: number,
+  files: File[],
+  endpoint: 'face' | 'faces',
+): Promise<any> {
+  const token = getToken()
+  const fd = new FormData()
+  // /face dùng field 'file' (1 file), /faces dùng 'files' (list)
+  if (endpoint === 'face') {
+    fd.append('file', files[0])
+  } else {
+    for (const f of files) fd.append('files', f)
+  }
+  const headers: Record<string, string> = {}
+  if (token) headers['Authorization'] = `Bearer ${token}`
+  const res = await fetch(`${BASE_URL}/api/enroll/${userId}/${endpoint}`, {
+    method: 'POST',
+    body: fd,
+    headers,
+  })
+  if (res.status === 401) {
+    clearToken()
+    window.dispatchEvent(new CustomEvent('svpro:auth-required'))
+    throw new Error('Phiên đăng nhập hết hạn')
+  }
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }))
+    throw new Error(err.detail || `HTTP ${res.status}`)
+  }
+  return res.json()
+}
+
+export const enrollApi = {
+  uploadFace:  enrollUploadFile,
+  uploadFaces: enrollUploadFiles,
+  remove: (userId: number) =>
+    apiFetch<void>(`/api/enroll/${userId}/face`, { method: 'DELETE' }),
+  status: () => apiFetch<{
+    ready?: boolean
+    ai_core_status?: string
+    available?: boolean
+  }>(`/api/enroll/status`),
+}
+
+// ── Face Search API ───────────────────────────────────────────────────────────
+
+export interface FaceMatch {
+  type:        'user' | 'stranger'
+  similarity:  number
+  distance:    number
+  // user fields
+  user_id?:    number
+  person_id?:  string
+  name?:       string
+  role?:       string
+  // stranger fields
+  stranger_id?: string
+  last_image?:  string
+  cameras?:     string[]
+}
+
+async function faceSearchByImage(
+  file: File,
+  opts: { limit?: number; min_similarity?: number; include_strangers?: boolean } = {},
+): Promise<FaceMatch[]> {
+  const token = getToken()
+  const fd = new FormData()
+  fd.append('file', file)
+  const params = new URLSearchParams()
+  if (opts.limit) params.set('limit', String(opts.limit))
+  if (opts.min_similarity != null) params.set('min_similarity', String(opts.min_similarity))
+  if (opts.include_strangers != null) params.set('include_strangers', String(opts.include_strangers))
+  const headers: Record<string, string> = {}
+  if (token) headers['Authorization'] = `Bearer ${token}`
+  const res = await fetch(`${BASE_URL}/api/face-search?${params}`, {
+    method: 'POST', body: fd, headers,
+  })
+  if (res.status === 401) {
+    clearToken()
+    window.dispatchEvent(new CustomEvent('svpro:auth-required'))
+    throw new Error('Phiên đăng nhập hết hạn')
+  }
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }))
+    throw new Error(err.detail || `HTTP ${res.status}`)
+  }
+  return res.json()
+}
+
+export const faceSearchApi = {
+  search: faceSearchByImage,
+}
+
+// ── Settings API ──────────────────────────────────────────────────────────────
+
+export interface AppSetting {
+  key:        string
+  value:      any
+  updated_at: string
+  updated_by: string | null
+}
+
+export interface RetentionRun {
+  id:            number
+  started_at:    string
+  finished_at:   string | null
+  triggered_by:  string
+  deleted_files: number
+  deleted_bytes: number
+  deleted_rows:  Record<string, number> | null
+  error:         string | null
+}
+
+export const settingsApi = {
+  list: () => apiFetch<AppSetting[]>('/api/settings'),
+  get:  (key: string) => apiFetch<AppSetting>(`/api/settings/${encodeURIComponent(key)}`),
+  update: (key: string, value: any) =>
+    apiFetch<AppSetting>(`/api/settings/${encodeURIComponent(key)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ value }),
+    }),
+  runCleanup: () =>
+    apiFetch<{
+      run_id: number; files_deleted: number; bytes_deleted: number
+      rows_deleted: Record<string, number>
+      took_seconds?: number; error?: string | null
+    }>(`/api/settings/cleanup/run`, { method: 'POST' }),
+  listRuns: () => apiFetch<RetentionRun[]>('/api/settings/cleanup/runs'),
+}
+
+// ── Strangers API ─────────────────────────────────────────────────────────────
+
+export interface StrangerImage {
+  image_path: string
+  source_id:  string | null
+  created_at: string
+  score:      number | null
+}
+
+export const strangersApi = {
+  addNotes: (uid: string, notes: string) =>
+    apiFetch<any>(`/api/strangers/${uid}/notes`, {
+      method: 'POST',
+      body: JSON.stringify({ notes }),
+    }),
+  remove: (uid: string) =>
+    apiFetch<void>(`/api/strangers/${uid}`, { method: 'DELETE' }),
+  listImages: (uid: string, limit = 60) =>
+    apiFetch<StrangerImage[]>(`/api/strangers/${uid}/images?limit=${limit}`),
+  dedup: (apply: boolean, threshold = 0.55) =>
+    apiFetch<{
+      clusters_found: number
+      strangers_removed: number
+      dry_run: boolean
+      threshold: number
+    }>(`/api/strangers/dedup?apply=${apply}&threshold=${threshold}`,
+       { method: 'POST' }),
 }
 
 // ── Vehicles API ──────────────────────────────────────────────────────────────

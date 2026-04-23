@@ -964,15 +964,23 @@ class PlateOCR(NvDsPyFuncPlugin):
         if not had_vehicles and self._frame_counts[source_id] % skip != 0:
             return
 
-        # Get raw frame pixels (RGBA, HWC) from GStreamer buffer
+        # Get raw frame pixels (RGBA, HWC) from GStreamer buffer.
+        # Có thể fail (nvjpeg decode error, batch corruption) — skip frame thay
+        # vì crash pipeline.
         try:
             n_frame = pyds.get_nvds_buf_surface(hash(buffer), frame_meta.batch_id)
             frame_rgba = np.array(n_frame, copy=True, order="C")
         except Exception as exc:
             logger.warning("Cannot read frame buffer: %s", exc)
             return
+        if frame_rgba is None or frame_rgba.size == 0:
+            return
 
-        frame_bgr = cv2.cvtColor(frame_rgba, cv2.COLOR_RGBA2BGR)
+        try:
+            frame_bgr = cv2.cvtColor(frame_rgba, cv2.COLOR_RGBA2BGR)
+        except cv2.error as exc:
+            logger.debug("cv2.cvtColor failed (skip frame): %s", exc)
+            return
         fh, fw = frame_bgr.shape[:2]
 
         roi = self._roi_zones.get(source_id)

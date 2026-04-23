@@ -31,6 +31,7 @@ _VN_TZ = timezone(timedelta(hours=7))
 _L1_BLACKLIST_TTL  = 60.0      # 1 phút — cập nhật tương đối nhanh
 _L1_CAPACITY       = 500       # Số entity tối đa trong L1 cache
 _REDIS_BL_TTL      = 300       # 5 phút trong Redis
+_NORMAL_LOG_INTERVAL = 60.0    # 60s throttle DB insert cho normal events (giảm spam)
 
 
 class Severity(Enum):
@@ -508,6 +509,9 @@ class BlacklistPyfunc(NvDsPyFuncPlugin):
         self._alert_manager = None
         self._audit_logger = None
         self._telemetry = None
+        self._last_normal_log: dict[str, float] = {}
+        # Redis client dùng để pub detections cho live overlay FE
+        self._redis_pub = None
 
     def on_start(self) -> bool:
         if not super().on_start():
@@ -555,6 +559,24 @@ class BlacklistPyfunc(NvDsPyFuncPlugin):
         except Exception:
             self._telemetry = None
 
+        # Load camera_zones dynamically from DB if not set in module.yml.
+        # This avoids hardcoding camera IDs in YAML — new cameras are auto-discovered.
+        camera_zones = self._camera_zones
+        if not camera_zones and os.environ.get("POSTGRES_DSN"):
+            try:
+                import psycopg2
+                conn = psycopg2.connect(os.environ["POSTGRES_DSN"])
+                cur = conn.cursor()
+                cur.execute("SELECT id, zone FROM cameras WHERE enabled=true AND zone IS NOT NULL")
+                for row_id, row_zone in cur.fetchall():
+                    camera_zones[f"cam_{row_id}"] = row_zone
+                cur.close()
+                conn.close()
+                if camera_zones:
+                    logger.info("Loaded camera_zones from DB: %s", camera_zones)
+            except Exception as exc:
+                logger.warning("Failed to load camera_zones from DB: %s", exc)
+
         # Initialize blacklist engine (DB/Redis optional; will degrade gracefully)
         try:
             import redis
@@ -575,10 +597,12 @@ class BlacklistPyfunc(NvDsPyFuncPlugin):
             blacklist_engine.initialize(
                 db_dsn=os.environ.get("POSTGRES_DSN", ""),
                 redis_client=r,
-                camera_zones=self._camera_zones,
+                camera_zones=camera_zones,
                 zone_access=self._zone_access,
                 zone_time_rules=self._zone_time_rules,
             )
+            # Giữ reference cho detection publish (live overlay FE)
+            self._redis_pub = r
         except Exception as exc:
             logger.warning("BlacklistEngine initialize failed (continuing): %s", exc)
 
@@ -590,6 +614,146 @@ class BlacklistPyfunc(NvDsPyFuncPlugin):
             self._process_frame_safe(frame_meta)
         except Exception as exc:
             logger.warning("Business logic error: %s", exc)
+        # Publish detection metadata to Redis pub/sub → FE overlay consumes
+        # qua backend WebSocket. Chạy ngoài try-safe để không chặn pipeline
+        # nếu Redis tạm thời không reachable.
+        try:
+            self._publish_detections(frame_meta)
+        except Exception as exc:
+            logger.debug("Detection publish failed: %s", exc)
+
+    def _publish_detections(self, frame_meta: NvDsFrameMeta) -> None:
+        """
+        Publish JSON detection bbox + label vào Redis channel
+        `svpro:detections:{source_id}` để backend WebSocket forward tới FE.
+
+        Payload: list các object mà DeepStream thấy trong frame, kèm metadata
+        từ stage FR/LPR. FE render canvas overlay từ data này.
+        """
+        if self._redis_pub is None:
+            return
+        source_id = str(getattr(frame_meta, "source_id", "unknown"))
+        # NvDsFrameMeta không expose width/height trực tiếp. Lấy qua video_frame
+        # (savant_rs VideoFrame) đi kèm — thuộc tính `width` / `height` là
+        # resolution thật của frame trên pipeline (match ảnh save).
+        frame_w = 0
+        frame_h = 0
+        try:
+            vf = getattr(frame_meta, "video_frame", None)
+            if vf is not None:
+                frame_w = int(getattr(vf, "width", 0) or 0)
+                frame_h = int(getattr(vf, "height", 0) or 0)
+        except Exception:
+            pass
+
+        dets = []
+        for obj_meta in getattr(frame_meta, "objects", []):
+            try:
+                bb = obj_meta.bbox
+                x1 = int(bb.left)
+                y1 = int(bb.top)
+                x2 = int(bb.left + bb.width)
+                y2 = int(bb.top + bb.height)
+            except Exception:
+                continue
+
+            label = str(getattr(obj_meta, "label", "") or "")
+            if label == "frame":   # skip auto frame object
+                continue
+
+            track_id = None
+            try:
+                tid = getattr(obj_meta, "track_id", None)
+                track_id = int(tid) if tid else None
+            except Exception:
+                pass
+
+            det: dict = {
+                "label":    label,
+                "bbox":     [x1, y1, x2, y2],
+                "track_id": track_id,
+            }
+
+            # FR attrs (person_id / name / role / confidence / is_stranger)
+            try:
+                pid = obj_meta.get_attr_meta("fr", "person_id")
+                if pid is not None and getattr(pid, "value", None):
+                    det["person_id"] = str(pid.value)
+            except Exception:
+                pass
+            try:
+                pn = obj_meta.get_attr_meta("fr", "person_name")
+                if pn is not None and getattr(pn, "value", None):
+                    det["person_name"] = str(pn.value)
+            except Exception:
+                pass
+            try:
+                pr = obj_meta.get_attr_meta("fr", "person_role")
+                if pr is not None and getattr(pr, "value", None):
+                    det["person_role"] = str(pr.value)
+            except Exception:
+                pass
+            try:
+                fc = obj_meta.get_attr_meta("fr", "fr_confidence")
+                if fc is not None and getattr(fc, "value", None) is not None:
+                    det["fr_confidence"] = float(fc.value)
+            except Exception:
+                pass
+
+            # LPR attrs (plate_number / category)
+            try:
+                pl = obj_meta.get_attr_meta("lpr", "plate_number")
+                if pl is not None and getattr(pl, "value", None):
+                    det["plate_number"] = str(pl.value)
+            except Exception:
+                pass
+            try:
+                pc = obj_meta.get_attr_meta("lpr", "plate_category")
+                if pc is not None and getattr(pc, "value", None):
+                    det["plate_category"] = str(pc.value)
+            except Exception:
+                pass
+
+            dets.append(det)
+
+        # ── Face bboxes từ FaceRecognizer qua frame_meta tag ───────────────
+        # FR pyfunc ghi JSON list face bboxes + metadata (nếu L1 cache match)
+        # → merge vào publish như 1 layer detection độc lập (label="face").
+        # FE vẽ khung mặt chính xác vị trí (nhỏ, bên trong bbox person).
+        try:
+            raw_faces = frame_meta.get_tag("fr_face_bboxes")
+            if raw_faces:
+                import json as _json
+                face_list = _json.loads(raw_faces) or []
+                for f in face_list:
+                    face_det: dict = {
+                        "label":    "face",
+                        "bbox":     f.get("bbox"),
+                        "track_id": f.get("track_id"),
+                    }
+                    for k in ("person_id", "person_name", "person_role",
+                              "fr_confidence", "is_stranger", "score"):
+                        if k in f:
+                            face_det[k] = f[k]
+                    dets.append(face_det)
+        except Exception:
+            pass
+
+        if not dets:
+            return
+
+        import json as _json
+        payload = _json.dumps({
+            "ts":         time.time(),
+            "source_id":  source_id,
+            "frame_w":    frame_w,
+            "frame_h":    frame_h,
+            "detections": dets,
+        }, separators=(",", ":"))
+        try:
+            self._redis_pub.publish(f"svpro:detections:{source_id}", payload)
+        except Exception as exc:
+            logger.debug("Redis publish failed: %s", exc)
 
     def _process_frame_safe(self, frame_meta: NvDsFrameMeta) -> None:
         source_id = str(getattr(frame_meta, "source_id", "unknown"))
@@ -628,6 +792,21 @@ class BlacklistPyfunc(NvDsPyFuncPlugin):
                         self._audit_logger.log_blacklist_event(ev, plate_crop=None)
                     if self._alert_manager:
                         self._alert_manager.send_alert(ev, image=None)
+                else:
+                    # Normal recognition log (throttled)
+                    log_key = f"vehicle_{source_id}_{plate_number}"
+                    if now - self._last_normal_log.get(log_key, 0.0) > _NORMAL_LOG_INTERVAL:
+                        self._last_normal_log[log_key] = now
+                        if self._audit_logger:
+                            self._audit_logger.log_recognition_event({
+                                "source_id": source_id,
+                                "camera_id": source_id,
+                                "label": obj_meta.label,
+                                "plate_number": plate_number,
+                                "plate_category": plate_category,
+                                "ocr_confidence": getattr(plate_attr, 'confidence', 0.0),
+                                "timestamp": datetime.now(_VN_TZ).isoformat(),
+                            })
 
             # --- FR observation ---
             person_id = None
@@ -660,4 +839,40 @@ class BlacklistPyfunc(NvDsPyFuncPlugin):
                         self._audit_logger.log_blacklist_event(ev, face_crop=None)
                     if self._alert_manager:
                         self._alert_manager.send_alert(ev, image=None)
+                else:
+                    # Normal recognition log (throttled).
+                    # FR pyfunc có thể yêu cầu skip log frame này (cờ suppress_event):
+                    # đó là khi cùng stranger_id đã ghi event trong cooldown — chống spam.
+                    suppress = False
+                    try:
+                        sup_attr = obj_meta.get_attr_meta("fr", "suppress_event")
+                        if sup_attr is not None and str(sup_attr.value) == "1":
+                            suppress = True
+                    except Exception:
+                        pass
+                    log_key = f"person_{source_id}_{person_id}"
+                    if not suppress and now - self._last_normal_log.get(log_key, 0.0) > _NORMAL_LOG_INTERVAL:
+                        self._last_normal_log[log_key] = now
+                        if self._audit_logger:
+                            is_stranger = (person_role == "unknown" or person_id.lower() == "stranger" or person_name.lower() == "stranger")
+                            # Đường dẫn ảnh face crop do FR pyfunc đã ghi attr (nếu có)
+                            image_path = None
+                            try:
+                                img_attr = obj_meta.get_attr_meta("fr", "image_path")
+                                if img_attr is not None:
+                                    image_path = str(img_attr.value)
+                            except Exception:
+                                pass
+                            self._audit_logger.log_recognition_event({
+                                "source_id": source_id,
+                                "camera_id": source_id,
+                                "label": obj_meta.label,
+                                "person_id": person_id,
+                                "person_name": person_name,
+                                "person_role": person_role,
+                                "match_score": getattr(pid_attr, 'confidence', 0.0),
+                                "is_stranger": is_stranger,
+                                "image_path": image_path,
+                                "timestamp": datetime.now(_VN_TZ).isoformat(),
+                            })
 

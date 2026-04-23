@@ -16,12 +16,14 @@ import cv2
 logger = logging.getLogger(__name__)
 
 # ── Ngưỡng chất lượng ──────────────────────────────────────────────────────────
-_MIN_SHARPNESS = 50.0       # Laplacian variance tối thiểu
-_MAX_YAW_DEG   = 30.0       # Góc xoay ngang tối đa (độ)
-_MAX_PITCH_DEG = 25.0       # Góc cúi/ngẩng tối đa (độ)
-_MIN_ILLUM     = 0.25       # Độ sáng tối thiểu (tỉ lệ 0-1)
-_MAX_ILLUM     = 0.95       # Độ sáng tối đa (tránh quá sáng/overexpose)
-_MIN_COMPOSITE = 0.50       # Điểm tổng hợp tối thiểu để QC pass
+_MIN_SHARPNESS = 110.0      # Laplacian variance tối thiểu (50 → 80 → 110, lọc thêm
+                             #  ảnh tay/tường/mannequin có pattern mờ)
+_MAX_YAW_DEG   = 35.0       # Góc xoay ngang tối đa
+_MAX_PITCH_DEG = 30.0       # Góc cúi/ngẩng tối đa
+_MIN_ILLUM     = 0.20       # Độ sáng tối thiểu (nới cho ban đêm)
+_MAX_ILLUM     = 0.97       # Độ sáng tối đa
+_MIN_COMPOSITE = 0.50       # Điểm tổng hợp tối thiểu (0.35 → 0.42 → 0.50, siết
+                             #  thêm sau quan sát noise crop trên cam2/cam_online_1)
 
 
 def compute_sharpness(face_bgr: np.ndarray) -> float:

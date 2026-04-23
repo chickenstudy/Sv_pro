@@ -30,11 +30,24 @@ async def init_db() -> None:
     """
     global pool
     import asyncpg  # lazy import so unit/integration tests can patch init_db without asyncpg installed
+    import json as _json
+
+    async def _init_conn(conn):
+        # Tự decode/encode JSONB → Python dict/list (mặc định asyncpg trả str).
+        for typename in ("jsonb", "json"):
+            await conn.set_type_codec(
+                typename,
+                encoder=_json.dumps,
+                decoder=_json.loads,
+                schema="pg_catalog",
+            )
+
     pool = await asyncpg.create_pool(
         dsn      = _DB_DSN,
         min_size = 2,
         max_size = 10,
         command_timeout = 30,
+        init     = _init_conn,
     )
 
 

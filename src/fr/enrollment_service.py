@@ -42,74 +42,53 @@ class EnrollmentServer:
 
     def __init__(
         self,
-        scrfd_session,    # ort.InferenceSession đã load
-        arcface_session,  # ort.InferenceSession đã load
+        yolov8_face,           # YOLOv8FaceDetector instance đã load + warmup
+        arcface_session,       # ort.InferenceSession đã load
         host: str = "0.0.0.0",
         port: int = 8090,
+        reload_callback = None,   # callable() → reload staff embeddings + clear L1
     ):
-        # Nhận ONNX sessions đã warmup từ FaceRecognizer
-        self._scrfd    = scrfd_session
-        self._arcface  = arcface_session
-        self._host     = host
-        self._port     = port
+        # Nhận model instances đã warmup từ FaceRecognizer
+        self._yolov8_face     = yolov8_face
+        self._arcface         = arcface_session
+        self._host            = host
+        self._port            = port
+        self._reload_callback = reload_callback
 
     # ── Face detection (tái dụng logic từ FaceRecognizer) ────────────────────
 
     def _detect_best_face(self, image_bgr: np.ndarray) -> Optional[np.ndarray]:
         """
-        Phát hiện khuôn mặt bằng SCRFD session đã load, trả về ảnh 112×112.
-        Lấy khuôn mặt có confidence score cao nhất nếu có nhiều.
-        Trả về None nếu không phát hiện được khuôn mặt.
+        Phát hiện khuôn mặt bằng YOLOv8-face → ALIGN bằng 5-point landmarks
+        (warpAffine theo template insightface) → trả face 112×112 chuẩn ArcFace.
+
+        QUAN TRỌNG: dùng `face_align.align_face` — CÙNG hàm với runtime
+        FaceRecognizer. Nếu không, embedding enroll vs runtime sẽ KHÁC →
+        người quen bị nhận thành stranger.
         """
-        h, w = image_bgr.shape[:2]
-        model_sz = 640
-        scale = min(model_sz / h, model_sz / w)
-        new_h, new_w = int(h * scale), int(w * scale)
-        resized = cv2.resize(image_bgr, (new_w, new_h))
+        from .face_align import align_face
 
-        canvas = np.zeros((model_sz, model_sz, 3), dtype=np.uint8)
-        canvas[:new_h, :new_w] = resized
+        # Hạ conf tạm thời để dễ enroll ảnh operator upload (có thể blur/
+        # nghiêng hơn realtime). Threshold realtime giữ 0.55 để lọc noise cam.
+        saved_conf = self._yolov8_face.conf_thresh
+        try:
+            self._yolov8_face.conf_thresh = 0.30
+            dets = self._yolov8_face.detect(image_bgr)
+        finally:
+            self._yolov8_face.conf_thresh = saved_conf
 
-        inp = canvas[:, :, ::-1].astype(np.float32)    # BGR→RGB
-        inp = inp.transpose(2, 0, 1)[np.newaxis]        # [1,3,640,640]
-
-        input_name = self._scrfd.get_inputs()[0].name
-        outputs    = self._scrfd.run(None, {input_name: inp})
-
-        # Parse output: tìm bbox có score cao nhất
-        best_box, best_score = None, 0.0
-        CONF = 0.50
-
-        if len(outputs) >= 2:
-            num_strides = len(outputs) // 2
-            for i in range(num_strides):
-                sc_raw = outputs[i].squeeze()
-                bx_raw = outputs[i + num_strides]
-                if sc_raw.ndim == 2:
-                    sc_raw = sc_raw[:, 0]
-                mask = sc_raw > CONF
-                if not mask.any():
-                    continue
-                sc  = sc_raw[mask]
-                bx  = (bx_raw[mask] / scale)
-                idx = int(np.argmax(sc))
-                if float(sc[idx]) > best_score:
-                    best_score = float(sc[idx])
-                    best_box   = bx[idx].tolist()
-
-        if best_box is None:
+        if not dets:
+            logger.debug("Enroll YOLOv8: no face detected")
             return None
 
-        x1 = int(np.clip(best_box[0], 0, w))
-        y1 = int(np.clip(best_box[1], 0, h))
-        x2 = int(np.clip(best_box[2], 0, w))
-        y2 = int(np.clip(best_box[3], 0, h))
-
-        face_crop = image_bgr[y1:y2, x1:x2]
-        if face_crop.size == 0:
-            return None
-
-        return cv2.resize(face_crop, (112, 112), interpolation=cv2.INTER_LINEAR)
+        # Pick face có confidence cao nhất + có landmarks
+        bbox, score, kps = max(dets, key=lambda d: d[1])
+        if kps is None:
+            logger.warning("Enroll: face %s thiếu landmarks → fallback square-resize "
+                           "(embedding sẽ kém chính xác)", bbox)
+        # align_face nhận FRAME ĐẦY ĐỦ + landmarks toạ độ tuyệt đối (frame space)
+        # → warpAffine 112×112 chuẩn — giống hệt runtime.
+        return align_face(image_bgr, kps)
 
     def _extract_embedding(self, face_112: np.ndarray) -> np.ndarray:
         """
@@ -156,6 +135,31 @@ class EnrollmentServer:
                 json.dumps({"status": "ok", "service": "enrollment"}),
                 mimetype="application/json",
             )
+
+        @app.route("/internal/reload-embeddings", methods=["POST"])
+        def reload_embeddings():
+            """
+            Backend gọi sau khi enroll/update/delete user → AI core reload
+            Redis hash `svpro:staff:hash` + invalidate L1 cache → người vừa
+            enroll match được NGAY (không phải đợi TTL 5 phút).
+            """
+            if self._reload_callback is None:
+                return Response(
+                    json.dumps({"reloaded": False, "reason": "no callback wired"}),
+                    status=503, mimetype="application/json",
+                )
+            try:
+                self._reload_callback()
+                return Response(
+                    json.dumps({"reloaded": True}),
+                    mimetype="application/json",
+                )
+            except Exception as exc:
+                logger.error("Reload embeddings failed: %s", exc, exc_info=True)
+                return Response(
+                    json.dumps({"reloaded": False, "error": str(exc)}),
+                    status=500, mimetype="application/json",
+                )
 
         @app.route("/internal/enroll", methods=["POST"])
         def enroll():
@@ -234,10 +238,11 @@ class EnrollmentServer:
 
 
 def start_enrollment_server(
-    scrfd_session,
+    yolov8_face,
     arcface_session,
     host: str = "0.0.0.0",
     port: int = 8090,
+    reload_callback = None,
 ) -> None:
     """
     Khởi động EnrollmentServer trong daemon thread.
@@ -249,7 +254,9 @@ def start_enrollment_server(
         logger.info("Enrollment server đang chạy, bỏ qua.")
         return
 
-    server = EnrollmentServer(scrfd_session, arcface_session, host, port)
+    server = EnrollmentServer(
+        yolov8_face, arcface_session, host, port, reload_callback=reload_callback,
+    )
 
     _server_thread = threading.Thread(
         target=server.run,

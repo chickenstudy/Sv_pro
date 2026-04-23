@@ -9,7 +9,7 @@ class YOLOv8Converter(BaseComplexModelOutputConverter):
     Converter for YOLOv8-style Tensor outputs used by Savant nvinfer complex_model.
 
     It converts raw output0 tensor into:
-      - bbox tensor: (class_id, confidence, xc, yc, w, h)
+      - bbox tensor: (class_id, confidence, left, top, w, h)
       - attr tensor: empty (no extra attributes at this stage)
     """
 
@@ -50,8 +50,11 @@ class YOLOv8Converter(BaseComplexModelOutputConverter):
         roi_top, roi_left, roi_width, roi_height = roi
 
         # Scale from model input (640x640) to roi-relative coordinates, then offset by roi origin.
-        cx_scaled = cx / 640.0 * roi_width + roi_left
-        cy_scaled = cy / 640.0 * roi_height + roi_top
+        left = cx - w / 2.0
+        top = cy - h / 2.0
+        
+        left_scaled = left / 640.0 * roi_width + roi_left
+        top_scaled = top / 640.0 * roi_height + roi_top
         w_scaled = w / 640.0 * roi_width
         h_scaled = h / 640.0 * roi_height
 
@@ -59,8 +62,8 @@ class YOLOv8Converter(BaseComplexModelOutputConverter):
             [
                 class_ids.astype(np.float32),
                 confidences.astype(np.float32),
-                cx_scaled.astype(np.float32),
-                cy_scaled.astype(np.float32),
+                left_scaled.astype(np.float32),
+                top_scaled.astype(np.float32),
                 w_scaled.astype(np.float32),
                 h_scaled.astype(np.float32),
             ],
@@ -68,5 +71,9 @@ class YOLOv8Converter(BaseComplexModelOutputConverter):
         )
 
         attr_tensor = np.empty((n, 0), dtype=np.float32)
-        return bbox_tensor, attr_tensor
+        
+        if n > 0:
+            import logging
+            logging.getLogger(__name__).warning("bbox_tensor output: %s", bbox_tensor[:3])
 
+        return bbox_tensor, attr_tensor

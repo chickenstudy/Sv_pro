@@ -33,7 +33,10 @@ COPY --from=builder /app/dist/ /usr/share/nginx/html/
 
 EXPOSE 80
 
+# nginx:alpine có wget nhưng là busybox version với syntax khác → dùng wget với
+# flags đơn giản (-q -O -) hoặc /bin/sh test bằng nc. Ở đây dùng wget với
+# spider mode tương đương HEAD request, không tải nội dung.
 HEALTHCHECK --interval=15s --timeout=5s --retries=3 \
-    CMD wget -qO- http://localhost:80 || exit 1
+    CMD wget --spider -q http://127.0.0.1:80/ || exit 1
 
 CMD ["nginx", "-g", "daemon off;"]

@@ -132,9 +132,10 @@ def sync_to_go2rtc(cameras: "list[CameraRow] | None", client: httpx.Client) -> N
             try:
                 resp = client.put(
                     f"{GO2RTC_URL}/api/streams",
-                    params={"name": cam.source_id},
-                    content=cam.rtsp_url.encode(),
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    params={
+                        "name": cam.source_id,
+                        "src": cam.rtsp_url
+                    },
                 )
                 resp.raise_for_status()
                 log.info("✅ Synced [%s] → %s", cam.source_id, cam.rtsp_url[:60])

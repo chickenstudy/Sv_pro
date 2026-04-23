@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { Routes, Route, Navigate } from 'react-router-dom'
 import { isLoggedIn } from './api'
 import LoginPage from './pages/LoginPage'
 import DashboardPage from './pages/DashboardPage'
@@ -9,7 +9,7 @@ import VehiclesPage from './pages/VehiclesPage'
 import EventsPage from './pages/EventsPage'
 import AlertsPage from './pages/AlertsPage'
 import StrangersPage from './pages/StrangersPage'
-import DoorsPage from './pages/DoorsPage'
+import SettingsPage from './pages/SettingsPage'
 import AppShell from './components/AppShell'
 import './index.css'
 
@@ -44,11 +44,13 @@ export default function App() {
           <Route index element={<DashboardPage />} />
           <Route path="cameras" element={<CamerasPage />} />
           <Route path="users" element={<UsersPage />} />
+          {/* /enroll cũ → redirect sang /users (UsersPage có cả create + enroll + search) */}
+          <Route path="enroll" element={<Navigate to="/users" replace />} />
           <Route path="vehicles" element={<VehiclesPage />} />
           <Route path="events" element={<EventsPage />} />
           <Route path="alerts" element={<AlertsPage />} />
           <Route path="strangers" element={<StrangersPage />} />
-          <Route path="doors" element={<DoorsPage />} />
+          <Route path="settings" element={<SettingsPage />} />
           <Route path="login" element={<Navigate to="/" replace />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>

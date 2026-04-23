@@ -103,6 +103,27 @@ async def require_jwt(
     return username
 
 
+async def require_jwt_query_or_header(
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(_bearer),
+    t: Optional[str] = None,
+) -> str:
+    """
+    Như require_jwt nhưng cũng chấp nhận token qua query param `?t=...`.
+    Dùng cho endpoint serve ảnh — <img src="..."> không thể gắn header Authorization.
+    """
+    token: Optional[str] = None
+    if credentials:
+        token = credentials.credentials
+    elif t:
+        token = t
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Cần xác thực JWT")
+    username = _verify_token(token)
+    if not username:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token không hợp lệ hoặc đã hết hạn")
+    return username
+
+
 async def require_api_key(key: Optional[str] = Security(_api_key)) -> str:
     """
     Dependency: Yêu cầu API Key hợp lệ trong header X-API-Key.

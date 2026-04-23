@@ -23,8 +23,9 @@ try:
 except ImportError:  # pragma: no cover
     Instrumentator = None
 
-from .routers import cameras, users, vehicles, events, health, auth, doors, strangers, metrics, stream, enroll, images
+from .routers import cameras, users, vehicles, events, health, auth, doors, strangers, metrics, stream, enroll, images, detect_images, settings as settings_router, face_search
 from .database import init_db
+from .retention_cleanup import run_cleanup_now, ensure_recognition_log_partitions
 
 # ── Cấu hình từ biến môi trường ────────────────────────────────────────────────
 APP_TITLE   = "SV-PRO API"
@@ -42,13 +43,57 @@ for origin in CORS_ORIGINS:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Lifecycle hook: khởi tạo kết nối DB và các tài nguyên khi server start.
-    Dọn dẹp khi server shutdown.
+    Lifecycle hook: khởi tạo kết nối DB + APScheduler khi server start.
+    Dọn dẹp scheduler + pool khi shutdown.
     """
-    # Startup
+    # ── Startup ──────────────────────────────────────────────────────────────
     await init_db()
+
+    # Đảm bảo partition tháng hiện tại + 2 tháng tới có sẵn ngay khi boot.
+    try:
+        await ensure_recognition_log_partitions(months_ahead=2)
+    except Exception as exc:
+        import logging as _log
+        _log.getLogger("startup").warning("partition pre-create failed: %s", exc)
+
+    # APScheduler: cron job retention + partition auto-create.
+    scheduler = None
+    try:
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        from apscheduler.triggers.cron import CronTrigger
+        scheduler = AsyncIOScheduler(timezone="Asia/Ho_Chi_Minh")
+        # Retention: chạy 02:15 mỗi ngày (giờ thấp tải)
+        scheduler.add_job(
+            run_cleanup_now,
+            CronTrigger(hour=2, minute=15),
+            kwargs={"triggered_by": "cron"},
+            id="retention_cleanup",
+            replace_existing=True,
+        )
+        # Partition: chạy 02:00 mỗi ngày (trước retention 15 phút)
+        scheduler.add_job(
+            ensure_recognition_log_partitions,
+            CronTrigger(hour=2, minute=0),
+            kwargs={"months_ahead": 2},
+            id="partition_create",
+            replace_existing=True,
+        )
+        scheduler.start()
+        app.state.scheduler = scheduler
+    except ImportError:
+        import logging as _log
+        _log.getLogger("startup").warning(
+            "APScheduler không cài — retention chỉ chạy được khi gọi tay /api/settings/cleanup/run"
+        )
+
     yield
-    # Shutdown — không cần làm gì thêm (connection pool tự đóng)
+
+    # ── Shutdown ─────────────────────────────────────────────────────────────
+    if scheduler is not None:
+        try:
+            scheduler.shutdown(wait=False)
+        except Exception:
+            pass
 
 
 # ── Khởi tạo FastAPI app ────────────────────────────────────────────────────────
@@ -87,3 +132,6 @@ app.include_router(metrics.router,   prefix="/api/metrics",   tags=["Metrics"])
 app.include_router(stream.router,   prefix="",               tags=["Stream"])
 app.include_router(enroll.router,   prefix="/api/enroll",     tags=["Enrollment"])
 app.include_router(images.router,    prefix="/api/images",     tags=["Images"])
+app.include_router(detect_images.router, prefix="",            tags=["DetectImages"])
+app.include_router(settings_router.router, prefix="/api/settings", tags=["Settings"])
+app.include_router(face_search.router, prefix="/api/face-search", tags=["FaceSearch"])

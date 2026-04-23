@@ -10,8 +10,10 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { RefreshCw, Wifi, WifiOff, X, Grid2x2, Square, Monitor } from 'lucide-react'
+import Hls from 'hls.js'
 import type HlsType from 'hls.js'
 import { streamApi, type Camera } from '../api'
+import { DetectionOverlay } from './DetectionOverlay'
 
 // ── go2rtc helpers ────────────────────────────────────────────────────────────
 
@@ -25,35 +27,15 @@ function getGo2rtcBase(): string {
 }
 
 function buildUrls(base: string, srcId: string) {
+  // Các endpoint stream của go2rtc nằm dưới /api/. base ở đây là proxy
+  // path (mặc định "/go2rtc-api") → URL cuối qua nginx rewrite về go2rtc:1984.
   return {
-    webrtc:    `${base}/webrtc?src=${srcId}`,
-    hls:       `${base}/stream.m3u8?src=${srcId}`,
-    mse:       `${base}/stream.mp4?src=${srcId}`,
-    rtsp:      `${base}/rtsp/stream?src=${srcId}`,
+    webrtc:    `${base}/api/webrtc?src=${srcId}`,
+    hls:       `${base}/api/stream.m3u8?src=${srcId}`,
+    mse:       `${base}/api/stream.mp4?src=${srcId}`,
+    rtsp:      `${base}/api/rtsp/stream?src=${srcId}`,
     player_ui: `${base}/?src=${srcId}`,
   }
-}
-
-// ── go2rtc WebRTC client (lazy load từ CDN) ────────────────────────────────────
-
-let _go2rtcLoaded = false
-let _go2rtcInstance: any = null
-
-async function getGo2rtc(): Promise<any> {
-  if (_go2rtcInstance) return _go2rtcInstance
-  if (_go2rtcLoaded) throw new Error('go2rtc not available')
-
-  await new Promise<void>((resolve, reject) => {
-    const script = document.createElement('script')
-    script.src = 'https://cdn.jsdelivr.net/npm/go2rtc@latest/build/go2rtc-api.js'
-    script.onload = () => { _go2rtcLoaded = true; resolve() }
-    script.onerror = () => reject(new Error('Failed to load go2rtc'))
-    document.head.appendChild(script)
-  })
-
-  const base = getGo2rtcBase().replace(/^http/, 'ws').replace(/\/$/, '')
-  _go2rtcInstance = new (window as any).Go2rtc({})
-  return _go2rtcInstance
 }
 
 // ── CameraTile ─────────────────────────────────────────────────────────────────
@@ -68,14 +50,22 @@ interface CameraTileProps {
 export function CameraTile({ camera, compact }: CameraTileProps) {
   const videoRef    = useRef<HTMLVideoElement>(null)
   const hlsRef      = useRef<HlsType | null>(null)
-  const retryTimer   = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const pcRef       = useRef<RTCPeerConnection | null>(null)
+  const retryTimer  = useRef<ReturnType<typeof setTimeout> | null>(null)
   const go2rtcBase  = getGo2rtcBase()
 
   const [status, setStatus] = useState<TileStatus>(camera.enabled ? 'idle' : 'offline')
   const [errMsg, setErrMsg] = useState('')
+  const [sourceId, setSourceId] = useState<string>('')
+  // Toggle overlay (default: true — hiện bbox detect). Click vào video để tắt/bật.
+  const [showOverlay, setShowOverlay] = useState(true)
 
   const stopAll = useCallback(() => {
     if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null }
+    if (pcRef.current) {
+      try { pcRef.current.close() } catch {}
+      pcRef.current = null
+    }
     if (videoRef.current) {
       videoRef.current.pause()
       videoRef.current.srcObject = null
@@ -93,24 +83,26 @@ export function CameraTile({ camera, compact }: CameraTileProps) {
 
     try {
       const info = await streamApi.getInfo(camera.id)
-      const urls = buildUrls(go2rtcBase, info.source_id)
+      setSourceId(info.source_id)
 
-      // Ưu tiên 1: HLS (ổn định nhất, tương thích rộng)
-      if (urls.hls) {
-        const ok = await playHLS(videoRef.current, urls.hls)
-        if (ok) { setStatus('live'); return }
+      // Ưu tiên 1: WebRTC qua go2rtc (latency thấp ~200ms — chính). Nếu fail
+      // (network/firewall chặn UDP) → fallback HLS.
+      try {
+        const pc = await playWebRTC(videoRef.current, info.source_id, go2rtcBase)
+        pcRef.current = pc
+        setStatus('live')
+        return
+      } catch (wrtcErr) {
+        console.warn(`[cam ${camera.id}] WebRTC failed, fallback HLS:`, wrtcErr)
       }
 
-      // Ưu tiên 2: WebRTC qua go2rtc client
-      if (urls.webrtc) {
-        try {
-          await playWebRTC(videoRef.current, info.source_id, getGo2rtcBase())
-          setStatus('live'); return
-        } catch { /* continue to fallback */ }
-      }
+      // Fallback: HLS (latency cao 2-5s nhưng compatible Safari/iOS + qua firewall).
+      const hlsUrl = `${go2rtcBase}/api/stream.m3u8?src=${encodeURIComponent(info.source_id)}`
+      const ok = await playHLS(videoRef.current, hlsUrl)
+      if (ok) { setStatus('live'); return }
 
       setStatus('error')
-      setErrMsg('Stream không khả dụng. Kiểm tra camera và go2rtc.')
+      setErrMsg('Stream không khả dụng. Cả WebRTC và HLS đều fail.')
       retryTimer.current = setTimeout(play, 5000)
     } catch (err: any) {
       console.error(`[CameraTile cam=${camera.id}]`, err)
@@ -147,6 +139,30 @@ export function CameraTile({ camera, compact }: CameraTileProps) {
               playsInline
               style={{ width: '100%', height: '100%', objectFit: 'cover', background: '#000' }}
             />
+            {/* Overlay bbox detection realtime từ AI pipeline */}
+            {isLive && sourceId && (
+              <DetectionOverlay
+                sourceId={sourceId}
+                videoRef={videoRef}
+                enabled={showOverlay}
+              />
+            )}
+            {/* Toggle bbox overlay (nhỏ góc trên-phải) */}
+            {isLive && (
+              <button
+                onClick={() => setShowOverlay(v => !v)}
+                title={showOverlay ? 'Ẩn khung detect' : 'Hiện khung detect'}
+                style={{
+                  position: 'absolute', top: 6, right: 6, zIndex: 5,
+                  background: showOverlay ? 'rgba(34,197,94,0.85)' : 'rgba(0,0,0,0.55)',
+                  color: '#fff', border: 'none', padding: '3px 8px',
+                  borderRadius: 6, cursor: 'pointer', fontSize: 10, fontWeight: 700,
+                  backdropFilter: 'blur(4px)',
+                }}
+              >
+                {showOverlay ? '⬛ AI' : '⬜ AI'}
+              </button>
+            )}
             {isLoading && (
               <div className="cam-tile__overlay cam-tile__overlay--loading">
                 <RefreshCw size={22} className="animate-spin" />
@@ -320,7 +336,6 @@ export function CameraGrid({ cameras }: CameraGridProps) {
 
 function playHLS(video: HTMLVideoElement, url: string): Promise<boolean> {
   return new Promise(resolve => {
-    const Hls = (window as any).Hls
     if (!Hls || !Hls.isSupported()) {
       // Safari/iOS: native HLS
       if (video.canPlayType('application/vnd.apple.mpegurl')) {
@@ -333,16 +348,25 @@ function playHLS(video: HTMLVideoElement, url: string): Promise<boolean> {
       return
     }
 
-    const hls = new Hls({ enableWorker: true, lowLatencyMode: true })
+    // HLS dùng làm fallback khi WebRTC fail. Tắt lowLatencyMode để buffer
+    // 3-4 segment, ít rebuffer hơn — đánh đổi latency cao hơn (3-5s).
+    const hls = new Hls({
+      enableWorker:        true,
+      lowLatencyMode:      false,
+      backBufferLength:    30,
+      maxBufferLength:     10,
+      maxMaxBufferLength:  20,
+      liveSyncDurationCount: 3,
+    })
     hlsRefGlobal = hls
 
     hls.loadSource(url)
     hls.attachMedia(video)
 
-    hls.on('hlsError', (_: any, data: any) => {
+    hls.on(Hls.Events.ERROR, (_: any, data: any) => {
       if (data.fatal) { hls.destroy(); hlsRefGlobal = null; resolve(false) }
     })
-    hls.on('hlsFragLoaded', () => { video.play().catch(() => {}) })
+    hls.on(Hls.Events.FRAG_LOADED, () => { video.play().catch(() => {}) })
 
     setTimeout(() => resolve(true), 2000)
   })
@@ -350,54 +374,83 @@ function playHLS(video: HTMLVideoElement, url: string): Promise<boolean> {
 
 let hlsRefGlobal: HlsType | null = null
 
-async function playWebRTC(video: HTMLVideoElement, sourceId: string, base: string): Promise<void> {
-  return new Promise(async (resolve, reject) => {
-    try {
-      const go2rtc = await getGo2rtc()
-      const pc = new RTCPeerConnection({
-        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-      })
+/**
+ * WebRTC qua go2rtc — giao thức POST SDP đơn giản (không cần WebSocket).
+ *
+ * Flow chuẩn theo go2rtc docs:
+ *   1. Tạo PC, addTransceiver recvonly cho video + audio.
+ *   2. createOffer → setLocalDescription.
+ *   3. Wait ICE gathering complete (lấy đủ candidate vào SDP).
+ *   4. POST sdp text/plain → /api/webrtc?src=ID → nhận answer SDP.
+ *   5. setRemoteDescription(answer) → ontrack fire → gắn srcObject.
+ *
+ * Trả về RTCPeerConnection để caller cleanup khi unmount.
+ */
+async function playWebRTC(
+  video: HTMLVideoElement,
+  sourceId: string,
+  base: string,
+): Promise<RTCPeerConnection> {
+  const pc = new RTCPeerConnection({
+    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+  })
 
-      pc.ontrack = (e: any) => {
-        video.srcObject = e.streams[0]
-        video.play().catch(() => {})
+  // Recvonly: chỉ nhận, không gửi
+  pc.addTransceiver('video', { direction: 'recvonly' })
+  pc.addTransceiver('audio', { direction: 'recvonly' })
+
+  // Promise wait ontrack
+  const waitTrack = new Promise<void>((resolve) => {
+    pc.ontrack = (e) => {
+      video.srcObject = e.streams[0]
+      video.play().catch(() => {})
+      resolve()
+    }
+  })
+
+  // Tạo offer
+  const offer = await pc.createOffer()
+  await pc.setLocalDescription(offer)
+
+  // Đợi ICE gathering (tối đa 1.5s — tránh hang)
+  await new Promise<void>((resolve) => {
+    if (pc.iceGatheringState === 'complete') return resolve()
+    const t = setTimeout(resolve, 1500)
+    const check = () => {
+      if (pc.iceGatheringState === 'complete') {
+        clearTimeout(t)
+        pc.removeEventListener('icegatheringstatechange', check)
         resolve()
       }
-      pc.oniceconnectionstatechange = () => {
-        if (['failed', 'disconnected', 'closed'].includes(pc.iceConnectionState)) {
-          pc.close()
-          reject(new Error('WebRTC disconnected'))
-        }
-      }
-
-      // go2rtc WebRTC: tạo offer, gửi cho go2rtc, nhận answer
-      const offer = await pc.createOffer({ offerToReceiveAudio: false, offerToReceiveVideo: true })
-      await pc.setLocalDescription(offer)
-
-      const wsUrl = `${base.replace(/^http/, 'ws')}/webrtc`
-      const ws = new WebSocket(wsUrl)
-
-      ws.onopen = () => {
-        ws.send(JSON.stringify({ type: 'offer', src: sourceId, sdp: pc.localDescription?.sdp }))
-      }
-
-      ws.onmessage = (e) => {
-        try {
-          const msg = JSON.parse(e.data)
-          if (msg.type === 'answer') {
-            pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: msg.sdp }))
-            ws.close()
-          } else if (msg.candidate) {
-            pc.addIceCandidate(new RTCIceCandidate(msg))
-          }
-        } catch {}
-      }
-
-      ws.onerror = () => { ws.close(); reject(new Error('WebSocket error')) }
-      setTimeout(() => {
-        if (video.srcObject) resolve()
-        else reject(new Error('WebRTC timeout'))
-      }, 8000)
-    } catch (e) { reject(e) }
+    }
+    pc.addEventListener('icegatheringstatechange', check)
   })
+
+  // POST SDP offer → nhận answer
+  const url = `${base}/api/webrtc?src=${encodeURIComponent(sourceId)}`
+  const resp = await fetch(url, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/sdp' },
+    body:    pc.localDescription?.sdp || '',
+  })
+  if (!resp.ok) {
+    pc.close()
+    throw new Error(`WebRTC HTTP ${resp.status}`)
+  }
+  const answerSdp = await resp.text()
+  if (!answerSdp.startsWith('v=')) {
+    pc.close()
+    throw new Error('WebRTC: invalid SDP answer')
+  }
+  await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp })
+
+  // Race: ontrack hoặc timeout 8s
+  await Promise.race([
+    waitTrack,
+    new Promise<void>((_, reject) =>
+      setTimeout(() => reject(new Error('WebRTC track timeout')), 8000),
+    ),
+  ])
+
+  return pc
 }

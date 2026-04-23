@@ -127,6 +127,17 @@ class AuditLogger:
         except queue.Full:
             logger.warning("AuditLogger queue full — dropped linked event")
 
+    def log_recognition_event(self, payload: dict) -> None:
+        """
+        Enqueue ghi nhận diện bình thường (LPR/FR không vi phạm) vào DB.
+        """
+        if not self._initialized or not self._db_dsn:
+            return
+        try:
+            self._queue.put_nowait(("recognition", payload, None, None, None))
+        except queue.Full:
+            pass  # Normal recognitions dropping is okay if queue is full
+
     # ──────────────────────────────────────────────────────────────────────────
     # Background writer
     # ──────────────────────────────────────────────────────────────────────────
@@ -147,6 +158,8 @@ class AuditLogger:
                     self._write_blacklist(obj, face_crop, vehicle_crop, plate_crop)
                 elif kind == "linked":
                     self._write_linked(obj)
+                elif kind == "recognition":
+                    self._write_recognition(obj)
             except Exception as exc:
                 logger.error("AuditLogger write error: %s", exc, exc_info=True)
             finally:
@@ -314,6 +327,54 @@ class AuditLogger:
             if conn:
                 self._db_pool.putconn(conn)
 
+    def _write_recognition(self, payload: dict) -> None:
+        """
+        Gắn event nhận diện bình thường vào bảng recognition_logs.
+        """
+        if not self._db_pool:
+            return
+        conn = None
+        try:
+            conn = self._db_pool.getconn()
+            cur  = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO recognition_logs
+                  (source_id, camera_id, label, person_id, match_score, is_stranger, plate_number, plate_category, ocr_confidence, created_at, metadata_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    payload.get("source_id"),
+                    payload.get("camera_id", payload.get("source_id")),
+                    payload.get("label", "unknown"),
+                    payload.get("person_id"),
+                    payload.get("match_score"),
+                    payload.get("is_stranger", False),
+                    payload.get("plate_number"),
+                    payload.get("plate_category"),
+                    payload.get("ocr_confidence"),
+                    payload.get("timestamp"),
+                    json.dumps({
+                        k: v for k, v in {
+                            "person_name": payload.get("person_name"),
+                            "person_role": payload.get("person_role"),
+                            "image_path":  payload.get("image_path"),
+                        }.items() if v is not None
+                    }) if (payload.get("person_name") or payload.get("image_path")) else None
+                ),
+            )
+            conn.commit()
+            cur.close()
+        except Exception as exc:
+            logger.error("DB recognition_logs insert error: %s", exc)
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+        finally:
+            if conn:
+                self._db_pool.putconn(conn)
 
 # ── Singleton instance ────────────────────────────────────────────────────────
 audit_logger = AuditLogger()
