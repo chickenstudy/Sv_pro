@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   UserX, RefreshCw, Clock, AlertTriangle, Ghost, X, User, Camera as CameraIcon,
-  Save, Trash2, UserPlus, Search, GitMerge,
+  Save, Trash2, UserPlus, Search, GitMerge, ChevronLeft, ChevronRight,
 } from 'lucide-react'
 import { detectImageUrl, getToken, strangersApi, type StrangerImage } from '../api'
 import { FaceSearchModal } from './UsersPage'
@@ -42,7 +42,31 @@ async function fetchStrangers(params: {
   return res.json()
 }
 
-const PAGE_SIZE = 30
+const PAGE_SIZE = 24
+
+function Pagination({ page, hasNext, onPrev, onNext, total }: {
+  page: number; hasNext: boolean; onPrev: () => void; onNext: () => void; total: number
+}) {
+  const btn: React.CSSProperties = {
+    minWidth: 32, height: 30, padding: '0 8px',
+    background: 'var(--bg-elevated)', border: '1px solid var(--border)',
+    borderRadius: 'var(--r-sm)', color: 'var(--text-secondary)',
+    fontSize: 12, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4,
+  }
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, padding: '10px 0' }}>
+      <button onClick={onPrev} disabled={page <= 1} style={{ ...btn, opacity: page <= 1 ? 0.4 : 1 }}>
+        <ChevronLeft size={14} /> Trước
+      </button>
+      <span style={{ fontSize: 12, color: 'var(--text-muted)', minWidth: 80, textAlign: 'center' }}>
+        Trang {page} · {total} người
+      </span>
+      <button onClick={onNext} disabled={!hasNext} style={{ ...btn, opacity: !hasNext ? 0.4 : 1 }}>
+        Sau <ChevronRight size={14} />
+      </button>
+    </div>
+  )
+}
 
 function fmtTime(iso: string | null): string {
   if (!iso) return '—'
@@ -57,47 +81,40 @@ function fmtTime(iso: string | null): string {
 export default function StrangersPage() {
   const [strangers, setStrangers]       = useState<Stranger[]>([])
   const [loading, setLoading]           = useState(true)
-  const [loadingMore, setLoadingMore]   = useState(false)
   const [error, setError]               = useState<string | null>(null)
-  const [hasMore, setHasMore]           = useState(true)
-  const [offset, setOffset]             = useState(0)
+  const [hasMore, setHasMore]           = useState(false)
+  const [page, setPage]                 = useState(1)
   const [filterCamera, setFilterCamera] = useState('')
   const [selected, setSelected]         = useState<Stranger | null>(null)
   const [showSearch, setShowSearch]     = useState(false)
 
-  const loadStrangers = async (reset = false) => {
+  const loadStrangers = async (p = page) => {
     try {
-      reset ? setLoading(true) : setLoadingMore(true)
-      const currentOffset = reset ? 0 : offset
+      setLoading(true)
       const data = await fetchStrangers({
         source_id: filterCamera || undefined,
-        limit:     PAGE_SIZE,
-        offset:    currentOffset,
+        limit:     PAGE_SIZE + 1,
+        offset:    (p - 1) * PAGE_SIZE,
       })
-      if (reset) {
-        setStrangers(data)
-        setOffset(PAGE_SIZE)
-      } else {
-        setStrangers(prev => [...prev, ...data])
-        setOffset(o => o + PAGE_SIZE)
-      }
-      setHasMore(data.length === PAGE_SIZE)
+      setHasMore(data.length > PAGE_SIZE)
+      setStrangers(data.slice(0, PAGE_SIZE))
       setError(null)
     } catch (e: any) {
       setError(e.message)
     } finally {
       setLoading(false)
-      setLoadingMore(false)
     }
   }
 
   useEffect(() => {
-    loadStrangers(true)
-    // Refresh 5s — pipeline commit stranger trong ~250ms, UI nên bắt kịp gần
-    // realtime. Tăng tần suất không ảnh hưởng perf vì query nhẹ + cached.
-    const id = setInterval(() => loadStrangers(true), 5_000)
-    return () => clearInterval(id)
+    setPage(1)
   }, [filterCamera])
+
+  useEffect(() => {
+    loadStrangers(page)
+    const id = setInterval(() => loadStrangers(page), 30_000)
+    return () => clearInterval(id)
+  }, [filterCamera, page])
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -152,7 +169,7 @@ export default function StrangersPage() {
           onChange={e => setFilterCamera(e.target.value)}
           style={{ minWidth: 240, flex: 1 }}
         />
-        <button className="btn btn--ghost" onClick={() => loadStrangers(true)} disabled={loading}>
+        <button className="btn btn--ghost" onClick={() => loadStrangers(page)} disabled={loading}>
           <RefreshCw size={14} className={loading ? 'animate-spin' : ''} /> Làm mới
         </button>
         <button
@@ -170,7 +187,7 @@ export default function StrangersPage() {
             if (!ok) return
             const r = await strangersApi.dedup(true)
             alert(`Đã gộp ${r.clusters_found} cụm — xóa ${r.strangers_removed} stranger.`)
-            loadStrangers(true)
+            setPage(1); loadStrangers(1)
           }}
         >
           <GitMerge size={14} /> Gộp trùng
@@ -187,7 +204,7 @@ export default function StrangersPage() {
         <div className="empty-state" style={{ color: 'var(--danger)' }}>
           <AlertTriangle size={36} className="empty-state__icon" />
           {error}
-          <button className="btn btn--sm" onClick={() => loadStrangers(true)} style={{ marginTop: 8 }}>
+          <button className="btn btn--sm" onClick={() => loadStrangers(page)} style={{ marginTop: 8 }}>
             Thử lại
           </button>
         </div>
@@ -217,17 +234,13 @@ export default function StrangersPage() {
             ))}
           </div>
 
-          {hasMore && (
-            <div style={{ textAlign: 'center', padding: 12 }}>
-              <button
-                className="btn btn--ghost"
-                onClick={() => loadStrangers(false)}
-                disabled={loadingMore}
-              >
-                {loadingMore ? 'Đang tải...' : 'Tải thêm'}
-              </button>
-            </div>
-          )}
+          <Pagination
+            page={page}
+            hasNext={hasMore}
+            total={strangers.length + (page > 1 ? (page - 1) * PAGE_SIZE : 0)}
+            onPrev={() => setPage(p => Math.max(1, p - 1))}
+            onNext={() => setPage(p => p + 1)}
+          />
         </>
       )}
 
@@ -236,7 +249,7 @@ export default function StrangersPage() {
         <StrangerDetailModal
           stranger={selected}
           onClose={() => setSelected(null)}
-          onChanged={() => { setSelected(null); loadStrangers(true) }}
+          onChanged={() => { setSelected(null); loadStrangers(page) }}
         />
       )}
 

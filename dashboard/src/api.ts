@@ -4,6 +4,11 @@
 
 const BASE_URL = import.meta.env.VITE_API_URL || 'http://192.168.42.171:8000'  // '' = relative path, Nginx proxy /api/* → backend:8000
 
+// ── Dev offline bypass ────────────────────────────────────────────────────────
+// Đăng nhập admin/admin sẽ dùng token này — không cần backend chạy.
+const DEV_TOKEN = '__svpro_dev_admin_offline__'
+const DEV_ME = { username: 'admin', role: 'admin' }
+
 // ── Auth helpers ──────────────────────────────────────────────────────────────
 
 /** Lấy JWT token đang lưu trong localStorage. */
@@ -17,6 +22,9 @@ export const clearToken = (): void => localStorage.removeItem('svpro_token')
 
 /** Kiểm tra đã đăng nhập chưa. */
 export const isLoggedIn = (): boolean => !!getToken()
+
+/** True khi đang dùng offline dev bypass — không có backend thật. */
+export const isDevMode = (): boolean => getToken() === DEV_TOKEN
 
 // ── Fetch wrapper ─────────────────────────────────────────────────────────────
 
@@ -55,8 +63,12 @@ async function apiFetch<T>(
 // ── Auth API ──────────────────────────────────────────────────────────────────
 
 export const authApi = {
-  /** Đăng nhập, trả về token string. */
+  /** Đăng nhập, trả về token string. admin/admin → offline dev bypass, không cần backend. */
   login: async (username: string, password: string): Promise<string> => {
+    if (username === 'admin' && password === 'admin') {
+      setToken(DEV_TOKEN)
+      return DEV_TOKEN
+    }
     const data = await apiFetch<{ access_token: string }>('/api/auth/login', {
       method: 'POST',
       body: JSON.stringify({ username, password }),
@@ -66,7 +78,10 @@ export const authApi = {
   },
 
   /** Lấy thông tin tài khoản hiện tại. */
-  me: () => apiFetch<{ username: string; role: string }>('/api/auth/me'),
+  me: (): Promise<{ username: string; role: string }> => {
+    if (getToken() === DEV_TOKEN) return Promise.resolve(DEV_ME)
+    return apiFetch<{ username: string; role: string }>('/api/auth/me')
+  },
 }
 
 // ── Events API ────────────────────────────────────────────────────────────────
@@ -85,6 +100,10 @@ export interface AccessEvent {
   alert_sent: boolean
   // Đường dẫn tương đối ảnh trong /Detect — FE build URL: /api/detect-images/{image_path}
   image_path: string | null
+  /** Face cosine similarity 0..1 (chỉ recognition_logs face). */
+  match_score?: number | null
+  /** OCR confidence 0..1 (chỉ recognition_logs LPR). */
+  ocr_confidence?: number | null
 }
 
 /**
@@ -100,32 +119,187 @@ export function detectImageUrl(rel: string | null | undefined): string | null {
     : `/api/detect-images/${safe}`
 }
 
+export interface EventDetail {
+  id: string
+  source: 'recognition_log' | 'access_event'
+  // ── recognition_log fields ─────────────────────────────────────────────────
+  label?: string
+  person_id?: string
+  /** @deprecated Dùng fr_confidence. match_score giữ cho backward compat. */
+  match_score?: number | null
+  /** Face cosine similarity 0-1 (alias của match_score, canonical name). */
+  fr_confidence?: number | null
+  is_stranger?: boolean
+  plate_number?: string | null
+  plate_category?: string | null
+  ocr_confidence?: number | null
+  /** Tên hiển thị của người nhận diện (extract từ metadata_json). */
+  person_name?: string | null
+  /** Role: staff | admin | management | visitor | unknown (extract từ metadata_json). */
+  person_role?: string | null
+  /** Full raw metadata_json — chỉ cho debug/advanced use. */
+  metadata?: Record<string, any>
+  // ── access_event fields ────────────────────────────────────────────────────
+  event_type?: string
+  entity_type?: string | null
+  entity_id?: string | null
+  severity?: string
+  reason?: string | null
+  alert_sent?: boolean
+  /** Top-level cho cả access_event (json_path) và recognition_log
+   *  (metadata_json->>'image_path'). LPR: ảnh khung hình xe đầy đủ. */
+  image_path?: string | null
+  /** LPR: ảnh crop riêng của biển số (chỉ recognition_log). */
+  plate_image_path?: string | null
+  // ── common ─────────────────────────────────────────────────────────────────
+  camera_id?: string | null
+  source_id?: string | null
+  event_timestamp: string
+}
+
 export interface EventStats {
   date: string
   total: number
   by_severity: Record<string, number>
+  by_event_type: Record<string, number>
   top_cameras: Array<{ camera_id: string; count: number }>
 }
 
+export interface EventListResult {
+  data: AccessEvent[]
+  total: number   // từ X-Total-Count header
+}
+
+export interface EventListParams {
+  camera_id?: string
+  severity?: string
+  event_type?: string
+  from?: string
+  to?: string
+  limit?: number
+  offset?: number
+}
+
 export const eventsApi = {
-  list: (params?: {
-    camera_id?: string
-    severity?: string
-    event_type?: string
-    limit?: number
-    offset?: number
-  }) => {
+  /** URL cho SSE stream — token qua ?t= vì EventSource không gắn được header. */
+  streamUrl: (): string => {
+    const tok = getToken()
+    return tok
+      ? `${BASE_URL}/api/events/stream?t=${encodeURIComponent(tok)}`
+      : `${BASE_URL}/api/events/stream`
+  },
+
+  list: (params?: EventListParams) => {
     const q = new URLSearchParams()
     if (params?.camera_id) q.set('camera_id', params.camera_id)
     if (params?.severity) q.set('severity', params.severity)
     if (params?.event_type) q.set('event_type', params.event_type)
+    if (params?.from) q.set('from', params.from)
+    if (params?.to) q.set('to', params.to)
     if (params?.limit) q.set('limit', String(params.limit))
     if (params?.offset) q.set('offset', String(params.offset))
     return apiFetch<AccessEvent[]>(`/api/events?${q}`)
   },
 
+  /** Như list() nhưng trả về {data, total} — total từ X-Total-Count header. */
+  listWithTotal: async (params?: EventListParams): Promise<EventListResult> => {
+    const q = new URLSearchParams()
+    if (params?.camera_id) q.set('camera_id', params.camera_id)
+    if (params?.severity) q.set('severity', params.severity)
+    if (params?.event_type) q.set('event_type', params.event_type)
+    if (params?.from) q.set('from', params.from)
+    if (params?.to) q.set('to', params.to)
+    if (params?.limit) q.set('limit', String(params.limit))
+    if (params?.offset) q.set('offset', String(params.offset))
+    const token = getToken()
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+    if (token) headers['Authorization'] = `Bearer ${token}`
+    const res = await fetch(`${BASE_URL}/api/events?${q}`, { headers })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const data: AccessEvent[] = await res.json()
+    const total = parseInt(res.headers.get('X-Total-Count') ?? String(data.length), 10)
+    return { data, total }
+  },
+
   stats: () => apiFetch<EventStats>('/api/events/stats'),
   get: (id: string | number) => apiFetch<AccessEvent>(`/api/events/${id}`),
+  getDetail: (id: string | number) => apiFetch<EventDetail>(`/api/events/${id}/detail`),
+}
+
+// ── LPR API (đọc trực tiếp JSON sidecar /Detect/lpr/) ─────────────────────────
+
+export type LprCategory =
+  | 'XE_MAY_DAN_SU' | 'O_TO_DAN_SU' | 'BIEN_CA_NHAN'
+  | 'XE_MAY_DIEN'   | 'XE_QUAN_DOI'  | 'KHONG_XAC_DINH' | 'NOT_DETECTED'
+
+export const LPR_CATEGORY_LABEL: Record<LprCategory, string> = {
+  XE_MAY_DAN_SU:  'Xe máy dân sự',
+  O_TO_DAN_SU:    'Ô tô dân sự',
+  BIEN_CA_NHAN:   'Biển cá nhân',
+  XE_MAY_DIEN:    'Xe máy điện',
+  XE_QUAN_DOI:    'Xe quân đội',
+  KHONG_XAC_DINH: 'Không xác định',
+  NOT_DETECTED:   'Không đọc được',
+}
+
+export interface LprEvent {
+  id:                string                   // rel path không có .json — FE key + lookup chi tiết
+  json_path:         string
+  source_id:         string
+  camera_id:         string
+  date:              string                   // YYYY-MM-DD
+  category:          LprCategory | string
+  label?:            string | null            // car / motorcycle / truck / bus
+  plate_number?:     string | null
+  plate_category?:   string | null
+  ocr_confidence?:   number | null
+  plate_det_confidence?: number | null
+  timestamp?:        string | null
+  image_path?:       string | null            // ảnh khung hình xe
+  plate_image_path?: string | null            // crop biển số
+}
+
+export interface LprListResult {
+  data:  LprEvent[]
+  total: number
+}
+
+export interface LprStats {
+  date:        string
+  total:       number
+  by_category: Record<string, number>
+  by_camera:   Array<{ camera_id: string; count: number }>
+}
+
+export interface LprEventDetail extends LprEvent {
+  raw: Record<string, any>   // raw JSON sidecar gồm bbox + files
+}
+
+export const lprApi = {
+  list: async (params?: {
+    date?: string; category?: string; camera?: string;
+    search?: string; limit?: number; offset?: number;
+  }): Promise<LprListResult> => {
+    const q = new URLSearchParams()
+    if (params?.date)     q.set('date', params.date)
+    if (params?.category) q.set('category', params.category)
+    if (params?.camera)   q.set('camera', params.camera)
+    if (params?.search)   q.set('search', params.search)
+    if (params?.limit)    q.set('limit', String(params.limit))
+    if (params?.offset)   q.set('offset', String(params.offset))
+    const tok = getToken()
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+    if (tok) headers['Authorization'] = `Bearer ${tok}`
+    const res = await fetch(`${BASE_URL}/api/lpr/events?${q}`, { headers })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const data: LprEvent[] = await res.json()
+    const total = parseInt(res.headers.get('X-Total-Count') ?? String(data.length), 10)
+    return { data, total }
+  },
+  stats:    (date?: string) => apiFetch<LprStats>(`/api/lpr/stats${date ? `?date=${date}` : ''}`),
+  cameras:  () => apiFetch<string[]>('/api/lpr/cameras'),
+  /** id = rel_path không có .json (vd: lpr/bien_xe/2026-04-28/XE_MAY_DAN_SU/153919_434_motorcycle_29_E3_01246) */
+  getDetail: (id: string) => apiFetch<LprEventDetail>(`/api/lpr/event/${id.split('/').map(encodeURIComponent).join('/')}`),
 }
 
 // ── Cameras API ───────────────────────────────────────────────────────────────

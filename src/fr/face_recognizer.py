@@ -31,7 +31,13 @@ from savant.deepstream.meta.frame import NvDsFrameMeta
 from savant.deepstream.pyfunc import NvDsPyFuncPlugin
 from savant.deepstream.opencv_utils import nvds_to_gpu_mat
 
-from .face_quality import compute_quality_score, _MIN_COMPOSITE
+from .face_quality import compute_quality_score, compute_sharpness, _MIN_COMPOSITE
+
+# Early-gate ngưỡng sharpness: face Laplacian variance < ngưỡng → bỏ qua luôn
+# align_face + compute_quality_score (tiết kiệm ~1-2ms/face quá mờ). Ngưỡng thấp
+# hơn _MIN_SHARPNESS trong face_quality (110) vì chạy trên raw face_crop chưa
+# align — cho margin để không drop face biên.
+_EARLY_SHARPNESS_MIN = 30.0
 from .face_align import align_face as _shared_align_face
 from .stranger_reid import stranger_registry
 from .enrollment_service import start_enrollment_server
@@ -584,6 +590,16 @@ class FaceRecognizer(NvDsPyFuncPlugin):
         - is_new=True → INSERT mới với embedding
         - is_new=False → UPDATE last_seen, append camera vào metadata.cameras_seen,
           tăng metadata.appearances. Embedding không cập nhật mỗi frame để rẻ.
+
+        CANONICAL metadata_json schema (đồng bộ với migration 008 + face_search.py):
+          {
+            "cameras_seen":    [source_id, ...]
+            "appearances":     int
+            "last_image_path": str | null   (updated via _update_guest_face_last_image)
+            "first_seen_iso":  str (ISO)
+            "last_seen_iso":   str (ISO)    (auto-sync qua trigger trg_guest_faces_sync_metadata)
+          }
+
         Thread-safe (background save thread cũng có thể gọi).
         """
         if not self.db_dsn:
@@ -602,8 +618,13 @@ class FaceRecognizer(NvDsPyFuncPlugin):
                            quality_frames, face_embedding, metadata_json)
                         VALUES
                           (%s, %s, NOW(), NOW(), %s, %s::vector,
-                           jsonb_build_object('cameras_seen', jsonb_build_array(%s),
-                                              'appearances', 1))
+                           jsonb_build_object(
+                             'cameras_seen',    jsonb_build_array(%s),
+                             'appearances',     1,
+                             'last_image_path', null,
+                             'first_seen_iso',  to_jsonb(NOW()),
+                             'last_seen_iso',   to_jsonb(NOW())
+                           ))
                         ON CONFLICT (stranger_id) DO UPDATE SET
                           last_seen      = NOW(),
                           quality_frames = guest_faces.quality_frames + EXCLUDED.quality_frames,
@@ -784,6 +805,15 @@ class FaceRecognizer(NvDsPyFuncPlugin):
         if getattr(self, "_disabled", False):
             return
 
+        # Early exit: frame không có person object → không cần download frame
+        # hay chạy bất kỳ face detection nào. Tiết kiệm ~15ms/frame vô ích.
+        has_person = any(
+            not o.is_primary and o.label == "person"
+            for o in getattr(frame_meta, "objects", [])
+        )
+        if not has_person:
+            return
+
         # Telemetry: frames processed in AI core (by source_id)
         try:
             metrics.frames_processed_total.labels(source_id=source_id).inc()
@@ -807,6 +837,14 @@ class FaceRecognizer(NvDsPyFuncPlugin):
             if dl_cnt % 500 == 0:
                 logger.warning("[FR src=%s] Download fail ×%d: %s", source_id, dl_cnt, exc)
             return
+
+        # Chia sẻ frame đã download cho BehaviorPyfunc (stage sau) — tránh copy VRAM→RAM lần 2.
+        try:
+            from src.shared_frame_cache import put as _frame_cache_put
+            pts = int(getattr(frame_meta, "pts", 0) or 0)
+            _frame_cache_put(source_id, pts, frame_bgr)
+        except Exception:
+            pass
 
         # ── Detection strategy: SCRFD trên CROP của person bbox ─────────────
         # Lý do: cam giám sát xa, mặt người chỉ chiếm ~30px trong frame
@@ -834,17 +872,31 @@ class FaceRecognizer(NvDsPyFuncPlugin):
                 continue
 
         detections: list = []
+        # ── Ưu tiên sGIE: face_detector_sgie đã chạy trên GPU ở stage trước ──
+        # Nếu pipeline có stage nvinfer face_detector_sgie (module.yml), child
+        # object "face" + attr "landmarks" đã có sẵn — chỉ cần đọc metadata,
+        # không cần chạy lại YOLOv8-face ORT. Tiết kiệm ~30-50ms/frame per
+        # person crop.
         try:
-            with metrics.aicore_inference_ms.labels(camera_id=source_id, model="yolov8_face").time():
-                if person_objs:
-                    detections = self._detect_faces_on_persons(frame_bgr, person_objs)
-                # Fallback: nếu person-crop không cho ra detection nào (ví dụ person
-                # nhỏ < 50px), thử full-frame detection. Tốn hơn nhưng bắt
-                # được face khi không có YOLOv8 person bbox.
-                if not detections:
-                    detections = self._detect_full_frame(frame_bgr)
-        except Exception:
-            detections = self._detect_full_frame(frame_bgr)
+            detections = self._detect_faces_from_sgie(frame_meta)
+        except Exception as exc:
+            logger.debug("[FR src=%s] sGIE face read failed: %s", source_id, exc)
+            detections = []
+
+        if not detections:
+            # Fallback sang ORT YOLOv8-face — sGIE chưa build xong engine,
+            # hoặc output layer names không khớp.
+            try:
+                with metrics.aicore_inference_ms.labels(camera_id=source_id, model="yolov8_face").time():
+                    if person_objs:
+                        detections = self._detect_faces_on_persons(frame_bgr, person_objs)
+                    # Fallback tiếp: person-crop không cho ra detection (ví dụ person
+                    # nhỏ < 50px) → thử full-frame. Tốn hơn nhưng bắt được face
+                    # khi không có person bbox phù hợp.
+                    if not detections:
+                        detections = self._detect_full_frame(frame_bgr)
+            except Exception:
+                detections = self._detect_full_frame(frame_bgr)
 
         if not detections:
             cnt = getattr(self, "_no_face_cnt", 0) + 1
@@ -891,34 +943,48 @@ class FaceRecognizer(NvDsPyFuncPlugin):
             except Exception:
                 pass
 
+        # ═══════════════════════════════════════════════════════════════════
+        # PRE-PASS: filter từng face (L1 cache, sharpness, QC, anti-spoof) → gom
+        # danh sách face pass đủ filter để batch ArcFace. Không gọi ArcFace
+        # ở đây — batch 1 lần duy nhất ở giữa.
+        # ═══════════════════════════════════════════════════════════════════
+        pending: list[dict] = []
         for bbox, score, landmarks in detections:
             x1, y1, x2, y2 = bbox
-            # Mở rộng 30% để có context (tóc/cằm) cho cả crop save lẫn alignment.
             # Margin 60% — crop rộng hơn để bao tóc/cằm/cổ/vai (ảnh save đẹp
-            # hơn + FE thumbnail nhìn rõ mặt). 30% cũ quá chặt, mặt bị cắt cằm.
+            # hơn + FE thumbnail nhìn rõ mặt).
             ex1, ey1, ex2, ey2 = self._expand_face_bbox(
                 bbox, frame_bgr.shape[1], frame_bgr.shape[0], margin=0.60,
             )
-            face_crop = frame_bgr[ey1:ey2, ex1:ex2]   # crop có context cho save
+            face_crop = frame_bgr[ey1:ey2, ex1:ex2]
             if face_crop.size == 0:
                 continue
 
-            # Tìm track_id tương ứng từ DeepStream object_meta (nếu có)
             track_id = self._find_track_id(frame_meta, bbox)
             active[track_id] = now
 
-            # ── L1 Cache check ─────────────────────────────────────────────────
+            # L1 cache hit → attach attr ngay, không cần làm gì thêm
             cached = self._l1_cache.get(track_id)
             if cached:
                 self._write_attr(frame_meta, track_id, cached)
                 continue
 
-            # ── Quality Filter ─────────────────────────────────────────────────
-            # Alignment chuẩn insightface: warp trực tiếp trên frame đầy đủ với
-            # landmarks toạ độ ảnh — không crop trước (tránh lệch origin).
+            # ── Early-gate: bỏ qua face quá mờ trước khi align/QC tốn CPU ──
+            tight_face = frame_bgr[max(0, y1):y2, max(0, x1):x2]
+            if tight_face.size == 0:
+                continue
+            if compute_sharpness(tight_face) < _EARLY_SHARPNESS_MIN:
+                try:
+                    metrics.fr_recognition_total.labels(camera_id=source_id, result="low_quality").inc()
+                except Exception:
+                    pass
+                continue
+
+            # Align (chuẩn insightface: warp trên full frame với landmarks
+            # toạ độ tuyệt đối).
             face_aligned = self._align_face(frame_bgr, landmarks)
-            # Cho QC dùng landmarks đã chuyển sang toạ độ tương đối crop
-            # (chỉ dùng để tính yaw/pitch — không quan trọng absolute origin).
+
+            # QC composite (sharpness + illumination + pose)
             lm_local = (
                 landmarks.astype(np.float32) - np.array([x1, y1], dtype=np.float32)
                 if landmarks is not None else None
@@ -939,7 +1005,7 @@ class FaceRecognizer(NvDsPyFuncPlugin):
                 continue
             self._qc_fail_cnt = 0
 
-            # ── Anti-spoofing check ─────────────────────────────────────────────
+            # Anti-spoof
             if self.enable_anti_spoof and self._anti_spoof is not None:
                 if not self._check_anti_spoof(face_aligned):
                     sp_cnt = getattr(self, "_spoof_cnt", 0) + 1
@@ -953,24 +1019,56 @@ class FaceRecognizer(NvDsPyFuncPlugin):
                         pass
                     continue
 
-            # ── ArcFace embedding ───────────────────────────────────────────────
-            try:
-                with metrics.aicore_inference_ms.labels(camera_id=source_id, model="arcface").time():
-                    embedding = self._extract_embedding(face_aligned)
-            except Exception:
-                embedding = self._extract_embedding(face_aligned)
+            pending.append({
+                "bbox":         bbox,
+                "score":        score,
+                "face_crop":    face_crop,
+                "face_aligned": face_aligned,
+                "track_id":     track_id,
+                "quality":      quality,
+            })
 
-            # ── Matching: L1 → Redis → Stranger ────────────────────────────────
+        # ═══════════════════════════════════════════════════════════════════
+        # BATCH ArcFace: 1 CUDA launch xử lý hết faces pass filter.
+        # RTX 3060 với batch 3-8 nhanh hơn batch 1 × N rất nhiều do amortize
+        # kernel launch overhead + tận dụng Tensor Cores FP16.
+        # ═══════════════════════════════════════════════════════════════════
+        if not pending:
+            self._flush_expired_tracks(source_id, now)
+            return
+
+        try:
+            with metrics.aicore_inference_ms.labels(camera_id=source_id, model="arcface").time():
+                embeddings = self._extract_embeddings_batch(
+                    [p["face_aligned"] for p in pending]
+                )
+        except Exception as exc:
+            logger.warning("[FR src=%s] Batch ArcFace failed, fallback single: %s",
+                           source_id, exc)
+            embeddings = np.stack(
+                [self._extract_embedding(p["face_aligned"]) for p in pending],
+                axis=0,
+            )
+
+        # ═══════════════════════════════════════════════════════════════════
+        # POST-PASS: match + save/stranger với embeddings đã batch.
+        # ═══════════════════════════════════════════════════════════════════
+        for item, embedding in zip(pending, embeddings):
+            bbox       = item["bbox"]
+            face_crop  = item["face_crop"]
+            track_id   = item["track_id"]
+            quality    = item["quality"]
+            x1, y1, x2, y2 = bbox
+
             match = self._match_embedding(embedding)
 
             if match:
-                # Nhận diện được người quen
                 result = {
-                    "person_id":   match["id"],
-                    "person_name": match["name"],
-                    "person_role": match["role"],
+                    "person_id":     match["id"],
+                    "person_name":   match["name"],
+                    "person_role":   match["role"],
                     "fr_confidence": round(match["score"], 4),
-                    "is_stranger": False,
+                    "is_stranger":   False,
                 }
                 self._l1_cache.put(track_id, result)
                 self._write_attr(frame_meta, track_id, result)
@@ -979,9 +1077,7 @@ class FaceRecognizer(NvDsPyFuncPlugin):
                     metrics.fr_events_total.labels(camera_id=source_id).inc()
                 except Exception:
                     pass
-                
-                # Save crop — dùng face_crop CÓ CONTEXT (pad 30%) thay vì
-                # 112×112 squashed → ảnh đẹp hơn, FE thumbnail rõ hơn.
+
                 if self.save_crops and quality >= _MIN_COMPOSITE:
                     save_img = self._square_resize(face_crop, 256)
                     rel = self._queue_save(
@@ -1001,9 +1097,6 @@ class FaceRecognizer(NvDsPyFuncPlugin):
                         self._l1_cache.put(track_id, result)
                         self._write_attr(frame_meta, track_id, result)
             else:
-                # Người lạ → Stranger tracking
-                # Truyền face_crop có context (cho save) — _handle_stranger sẽ
-                # chọn best-of-N rồi mới queue_save.
                 self._handle_stranger(
                     source_id, track_id, embedding, face_crop, quality, now, wall,
                     bbox=(float(x1), float(y1), float(x2), float(y2)),
@@ -1019,6 +1112,58 @@ class FaceRecognizer(NvDsPyFuncPlugin):
     # ──────────────────────────────────────────────────────────────────────────
     # Phát hiện khuôn mặt (SCRFD)
     # ──────────────────────────────────────────────────────────────────────────
+
+    def _detect_faces_from_sgie(
+        self,
+        frame_meta: NvDsFrameMeta,
+    ) -> list[tuple[tuple[int, int, int, int], float, np.ndarray | None]]:
+        """
+        Đọc detection "face" + landmarks từ sGIE face_detector_sgie đã chạy ở
+        stage trước. Không chạy inference — chỉ đọc NvDsObjectMeta.
+
+        Output format giống _detect_faces_on_persons: list[(bbox, score, kp5x2)].
+        Return [] nếu không có child face nào (pipeline chưa có sGIE hoặc
+        TensorRT build lỗi) → caller sẽ fallback ORT path.
+        """
+        _ELEMENT_NAME = "face_detector_sgie"
+        out: list = []
+        for obj in getattr(frame_meta, "objects", []):
+            # sGIE children có is_primary=False và label="face"
+            if getattr(obj, "is_primary", False):
+                continue
+            if str(getattr(obj, "label", "")) != "face":
+                continue
+            try:
+                bb = obj.bbox
+                x1 = int(max(0, bb.left))
+                y1 = int(max(0, bb.top))
+                x2 = int(bb.left + bb.width)
+                y2 = int(bb.top  + bb.height)
+                score = float(getattr(obj, "confidence", 0.0))
+            except Exception:
+                continue
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            # Lấy landmarks attribute (10 floats = 5 kps × xy)
+            kp5x2: np.ndarray | None = None
+            try:
+                attr = obj.get_attr_meta(_ELEMENT_NAME, "landmarks")
+                if attr is not None and attr.value is not None:
+                    arr = np.asarray(attr.value, dtype=np.float32).reshape(-1)
+                    if arr.size >= 10:
+                        kp5x2 = arr[:10].reshape(5, 2)
+            except Exception:
+                pass
+
+            # Kiểm tra kích thước tối thiểu (tương thích _FACE_MIN_PX filter
+            # trong _detect_faces_on_persons).
+            if (x2 - x1) < _FACE_MIN_PX or (y2 - y1) < _FACE_MIN_PX:
+                continue
+
+            out.append(((x1, y1, x2, y2), score, kp5x2))
+
+        return out
 
     def _detect_faces_on_persons(
         self,
@@ -1255,19 +1400,56 @@ class FaceRecognizer(NvDsPyFuncPlugin):
 
     def _extract_embedding(self, face_112: np.ndarray) -> np.ndarray:
         """
-        Trích xuất vector đặc trưng 512 chiều từ ảnh khuôn mặt 112×112 bằng ArcFace R100.
-        Vector được chuẩn hóa L2 trước khi trả về để tính cosine similarity đơn giản.
+        Single-face wrapper — delegate sang _extract_embeddings_batch để
+        toàn bộ code path đi qua chung một bottleneck tối ưu.
         """
-        inp = face_112[:, :, ::-1].astype(np.float32)    # BGR→RGB
-        inp = (inp - 127.5) / 128.0                       # Chuẩn hóa [-1, 1]
-        inp = inp.transpose(2, 0, 1)[np.newaxis]          # [1, 3, 112, 112]
+        return self._extract_embeddings_batch([face_112])[0]
 
-        input_name = self._arcface.get_inputs()[0].name
-        emb = self._arcface.run(None, {input_name: inp})[0][0]   # [512]
+    def _extract_embeddings_batch(self, faces_112: list[np.ndarray]) -> np.ndarray:
+        """
+        Batch ArcFace R100 inference: [N, 3, 112, 112] → [N, 512] L2-normalized.
 
-        # Chuẩn hóa L2
-        norm = np.linalg.norm(emb)
-        return emb / (norm + 1e-6)
+        Ưu điểm:
+          - 1 CUDA launch xử lý N face → tiết kiệm overhead kernel launch khi
+            có nhiều mặt trong cùng frame (hoặc cross-camera nếu caller gộp).
+          - IOBinding (nếu available + provider=CUDA): ORT không thực hiện copy
+            CPU→GPU ngầm cho mỗi run; input tensor được bind 1 lần.
+          - Fallback: nếu IOBinding không khả dụng (CPU provider hoặc lỗi) →
+            gọi session.run() chuẩn, vẫn batch.
+        """
+        if not faces_112:
+            return np.empty((0, 512), dtype=np.float32)
+
+        # Stack [N, 112, 112, 3] BGR → [N, 3, 112, 112] RGB float32 [-1, 1]
+        batch = np.stack(faces_112, axis=0).astype(np.float32)
+        batch = batch[:, :, :, ::-1]                       # BGR→RGB
+        batch = (batch - 127.5) / 128.0
+        batch = batch.transpose(0, 3, 1, 2)                # NHWC → NCHW
+        batch = np.ascontiguousarray(batch)
+
+        input_name  = self._arcface.get_inputs()[0].name
+        output_name = self._arcface.get_outputs()[0].name
+
+        # ── Fast path: IOBinding trên CUDA provider ─────────────────────────
+        use_iobinding = (
+            "CUDAExecutionProvider" in self._arcface.get_providers()
+            and hasattr(self._arcface, "io_binding")
+        )
+        if use_iobinding:
+            try:
+                io = self._arcface.io_binding()
+                io.bind_cpu_input(input_name, batch)
+                io.bind_output(output_name, "cuda")
+                self._arcface.run_with_iobinding(io)
+                emb = io.copy_outputs_to_cpu()[0]          # [N, 512]
+            except Exception:
+                emb = self._arcface.run([output_name], {input_name: batch})[0]
+        else:
+            emb = self._arcface.run([output_name], {input_name: batch})[0]
+
+        # L2-normalize từng row
+        norms = np.linalg.norm(emb, axis=1, keepdims=True)
+        return (emb / (norms + 1e-6)).astype(np.float32)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Matching
@@ -1855,10 +2037,12 @@ class FaceRecognizer(NvDsPyFuncPlugin):
         best_area   = float("inf")  # nhỏ nhất = sát face nhất
 
         for obj_meta in frame_meta.objects:
-            bb = obj_meta.bbox
-            l, t = bb.left, bb.top
-            r, b = l + bb.width, t + bb.height
-            # Face center phải nằm trong bbox của person
+            try:
+                bb = obj_meta.bbox
+                l, t = bb.left, bb.top
+                r, b = l + bb.width, t + bb.height
+            except Exception:
+                continue
             if l <= fcx <= r and t <= fcy <= b:
                 area = bb.width * bb.height
                 if area < best_area:

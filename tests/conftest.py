@@ -1,10 +1,13 @@
 """
 Shared fixtures and mock stubs for SV-PRO test suite.
 
-IMPORTANT: We mock all heavy dependencies (Savant, PaddleOCR, ONNX, Redis,
-psycopg2) at the TOP of conftest.py so that src modules that import these
-at module-level can be safely imported in a plain Python environment
+IMPORTANT: We mock all heavy dependencies (Savant, ONNX, Redis, psycopg2)
+at the TOP of conftest.py so that src modules that import these at
+module-level can be safely imported in a plain Python environment
 (no GPU / DeepStream / Savant installed).
+
+Lưu ý: paddleocr stub vẫn giữ vì test pre-migration có thể import.
+plate_ocr.py hiện KHÔNG còn import paddleocr — stub chỉ là safety net.
 """
 
 import sys

@@ -15,6 +15,9 @@ import {
   User as UserIcon,
   Shield,
   Settings as SettingsIcon,
+  ScanLine,
+  Siren,
+  BarChart2,
 } from 'lucide-react'
 import useSWR from 'swr'
 import { clearToken, authApi } from '../api'
@@ -27,8 +30,11 @@ const NAV_ITEMS = [
   { path: '/users', icon: Users, label: 'Danh tính' },
   { path: '/strangers', icon: UserX, label: 'Người lạ' },
   { path: '/vehicles', icon: Car, label: 'Phương tiện' },
+  { path: '/lpr', icon: ScanLine, label: 'Biển số xe' },
+  { path: '/behavior', icon: Siren, label: 'Hành vi' },
   { path: '/events', icon: Activity, label: 'Sự kiện Access' },
   { path: '/alerts', icon: BellRing, label: 'Cảnh báo' },
+  { path: '/reports', icon: BarChart2, label: 'Báo cáo' },
   { path: '/settings', icon: SettingsIcon, label: 'Cài đặt' },
 ]
 
@@ -38,8 +44,11 @@ const PAGE_TITLES: Record<string, string> = {
   '/users': 'Danh tính + Khuôn mặt',
   '/strangers': 'Theo dõi Người lạ (Strangers)',
   '/vehicles': 'Quản lý Phương tiện (LPR)',
+  '/lpr': 'Nhận diện Biển số xe',
+  '/behavior': 'Nhận diện Hành vi',
   '/events': 'Sự kiện Access Control',
   '/alerts': 'Lịch sử Cảnh báo',
+  '/reports': 'Báo cáo & Thống kê',
   '/settings': 'Cài đặt hệ thống',
 }
 

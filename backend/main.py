@@ -23,7 +23,7 @@ try:
 except ImportError:  # pragma: no cover
     Instrumentator = None
 
-from .routers import cameras, users, vehicles, events, health, auth, doors, strangers, metrics, stream, enroll, images, detect_images, settings as settings_router, face_search
+from .routers import cameras, users, vehicles, events, health, auth, doors, strangers, metrics, stream, enroll, images, detect_images, settings as settings_router, face_search, lpr
 from .database import init_db
 from .retention_cleanup import run_cleanup_now, ensure_recognition_log_partitions
 
@@ -135,3 +135,4 @@ app.include_router(images.router,    prefix="/api/images",     tags=["Images"])
 app.include_router(detect_images.router, prefix="",            tags=["DetectImages"])
 app.include_router(settings_router.router, prefix="/api/settings", tags=["Settings"])
 app.include_router(face_search.router, prefix="/api/face-search", tags=["FaceSearch"])
+app.include_router(lpr.router,         prefix="/api/lpr",        tags=["LPR"])

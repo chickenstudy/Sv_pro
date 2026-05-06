@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 # ── Timezone & Đường dẫn ────────────────────────────────────────────────────────
 _VN_TZ        = timezone(timedelta(hours=7))
-_AUDIT_BASE   = "/Detect/audit"
+_AUDIT_BASE   = "/Detect/behavior"
 
 # ── Retention (ngày) ────────────────────────────────────────────────────────────
 _RETENTION_NORMAL_DAYS = 90
@@ -55,18 +55,26 @@ class AuditLogger:
         self._db_dsn: str | None = None
         self._audit_base: str    = _AUDIT_BASE
         self._db_pool            = None   # psycopg2 ThreadedConnectionPool
+        self._backend_notify_url: str | None = None  # POST /api/events/notify-recognition
 
         self._queue: queue.Queue = queue.Queue(maxsize=_QUEUE_MAXSIZE)
         self._worker: threading.Thread | None = None
         self._initialized = False
 
-    def initialize(self, db_dsn: str | None = None, audit_base: str | None = None) -> None:
+    def initialize(self, db_dsn: str | None = None, audit_base: str | None = None,
+                   backend_url: str | None = None) -> None:
         """
         Khởi tạo AuditLogger với kết nối DB (tùy chọn) và đường dẫn thư mục lưu trữ.
         Gọi 1 lần khi pipeline start.
         """
         self._db_dsn      = db_dsn
         self._audit_base  = audit_base or _AUDIT_BASE
+        self._backend_notify_url = (
+            f"{backend_url.rstrip('/')}/api/events/notify-recognition"
+            if backend_url else
+            os.environ.get("BACKEND_NOTIFY_URL",
+                           "http://svpro-backend-1:8000/api/events/notify-recognition")
+        )
         os.makedirs(self._audit_base, exist_ok=True)
 
         if db_dsn:
@@ -182,9 +190,9 @@ class AuditLogger:
 
         save_dir = os.path.join(
             self._audit_base,
+            event.source_id,
             date,
             event.event_type,
-            event.source_id,
         )
         os.makedirs(save_dir, exist_ok=True)
 
@@ -248,7 +256,7 @@ class AuditLogger:
         source_id    = getattr(linked_event, "source_id", "unknown")
         plate_number = linked_event.metadata.get("plate_number", "UNKNOWN") if hasattr(linked_event, "metadata") else "UNKNOWN"
 
-        save_dir = os.path.join(self._audit_base, date, "linked", source_id)
+        save_dir = os.path.join(self._audit_base, source_id, date, "linked")
         os.makedirs(save_dir, exist_ok=True)
 
         prefix = f"{ts}_{plate_number[:8]}"
@@ -356,15 +364,18 @@ class AuditLogger:
                     payload.get("timestamp"),
                     json.dumps({
                         k: v for k, v in {
-                            "person_name": payload.get("person_name"),
-                            "person_role": payload.get("person_role"),
-                            "image_path":  payload.get("image_path"),
+                            "person_name":      payload.get("person_name"),
+                            "person_role":      payload.get("person_role"),
+                            "image_path":       payload.get("image_path"),
+                            "plate_image_path": payload.get("plate_image_path"),
                         }.items() if v is not None
-                    }) if (payload.get("person_name") or payload.get("image_path")) else None
+                    }) if (payload.get("person_name") or payload.get("image_path") or payload.get("plate_image_path")) else None
                 ),
             )
             conn.commit()
             cur.close()
+            # Push SSE realtime cho dashboard (fire-and-forget, không block)
+            self._notify_sse(payload)
         except Exception as exc:
             logger.error("DB recognition_logs insert error: %s", exc)
             if conn:
@@ -375,6 +386,54 @@ class AuditLogger:
         finally:
             if conn:
                 self._db_pool.putconn(conn)
+
+    def _notify_sse(self, payload: dict) -> None:
+        """Fire-and-forget HTTP POST tới backend /notify-recognition để push SSE."""
+        if not self._backend_notify_url:
+            return
+        try:
+            import urllib.request, os
+            api_key = os.environ.get("INTERNAL_API_KEY", os.environ.get("SVPRO_API_KEY", ""))
+            plate   = payload.get("plate_number")
+            person  = payload.get("person_id")
+            is_stranger = payload.get("is_stranger", False)
+            if plate:
+                event_type  = "lpr_recognition"
+                entity_type = "plate"
+                entity_id   = plate
+                reason      = payload.get("plate_category") or payload.get("label")
+            elif is_stranger:
+                event_type  = "stranger_detected"
+                entity_type = "person"
+                entity_id   = person or "unknown"
+                reason      = "stranger"
+            else:
+                event_type  = "face_recognition"
+                entity_type = "person"
+                entity_id   = person or "unknown"
+                reason      = payload.get("person_name")
+
+            notify_payload = json.dumps({
+                "event_id":       payload.get("event_id", ""),
+                "event_type":     event_type,
+                "entity_type":    entity_type,
+                "entity_id":      entity_id,
+                "severity":       "HIGH" if is_stranger else "MEDIUM",
+                "camera_id":      payload.get("camera_id", payload.get("source_id")),
+                "source_id":      payload.get("source_id"),
+                "reason":         reason,
+                "event_timestamp": payload.get("timestamp", datetime.now(_VN_TZ).isoformat()),
+                "image_path":     payload.get("image_path"),
+            }).encode()
+            req = urllib.request.Request(
+                self._backend_notify_url,
+                data=notify_payload,
+                headers={"Content-Type": "application/json", "X-API-Key": api_key},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=1)
+        except Exception:
+            pass  # SSE push thất bại không ảnh hưởng ghi DB
 
 # ── Singleton instance ────────────────────────────────────────────────────────
 audit_logger = AuditLogger()

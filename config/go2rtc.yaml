@@ -48,5 +48,7 @@ streams:
     - rtsp://admin:admin@192.168.42.162:554/snl/live/1/1
   cam-face:
     - rtsp://admin:abcd124@@192.168.42.42:554/Streaming/Channels/101
+  bien_xe:
+    - rtsp://admin:abcd1234@192.168.42.170:331/snl/live/1/1
   cam_online_1:
     - rtsp://admin:abcd1234@192.168.42.140:554/snl/live/1/1

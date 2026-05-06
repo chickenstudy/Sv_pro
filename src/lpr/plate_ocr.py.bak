@@ -1,22 +1,14 @@
 """
 License Plate Recognition pyfunc for Savant pipeline.
 
-Two-stage (cả 2 đều ONNX Runtime GPU, KHÔNG dùng paddleocr library):
-  1. Plate detection  – YOLOv8l ONNX qua ONNX Runtime (CUDAExecutionProvider)
-  2. Plate OCR        – PP-OCRv4 mobile rec ONNX + CTC decode manual
+Two-stage:
+  1. Plate detection  – YOLOv8n ONNX via ONNX Runtime (CPU)
+  2. Plate OCR        – PaddleOCR v4 with lang='en' (CPU)
 
 Operates on vehicle objects (car / truck / bus / motorcycle) already
 detected by the primary YOLOv8s detector.  Reads the plate text and
 attaches it as an attribute that the draw function and JSON egress
 will forward downstream.
-
-Đã thay PaddleOCR library bằng PP-OCRv4 ONNX direct để:
-  - Giảm ~30-50ms/plate (không overhead Python library wrapper)
-  - Bỏ dependency nặng paddlepaddle-gpu (~2GB image size)
-  - Single inference path — dễ debug/profile hơn
-
-Trade-off: mất angle_classifier → biển nghiêng > 15° có thể sai. Chấp nhận
-vì đa số camera giám sát có góc thẳng ± 10°.
 """
 
 import logging
@@ -38,8 +30,8 @@ from src.telemetry import metrics
 
 logger = logging.getLogger(__name__)
 
-# Base directory for saving detected crops (overridable via save_dir kwarg)
-_DETECT_BASE_DIR = "/Detect/lpr"
+# Base directory for saving detected crops
+_DETECT_BASE_DIR = "/Detect"
 
 # Vietnam timezone (UTC+7)
 _VN_TZ = timezone(timedelta(hours=7))
@@ -79,24 +71,17 @@ _CATEGORY_UNKNOWN = "KHONG_XAC_DINH"
 # ── Object tracking ───────────────────────────────────────────────────────────
 
 # A track with no new detection for this many seconds is considered expired.
-# Giảm từ 2.0 → 1.5s: flush kết quả nhanh hơn khi xe đi qua thoáng.
-_TRACK_MAX_AGE = 1.5
+_TRACK_MAX_AGE = 2.0
 
 # Don't save the same plate number twice within this window (seconds).
-_PLATE_DEDUP_SECS = 30.0
-
-# Direct-mode: save ngay khi đủ số candidates thay vì chờ track expire.
-_DIRECT_SAVE_MIN_CANDIDATES = 3   # vote sau 3 lần đọc tốt
-_DIRECT_SAVE_INTERVAL = 15.0      # tối thiểu 15s giữa 2 lần lưu cùng 1 biển
+_PLATE_DEDUP_SECS = 60.0
 
 
 # Plate crops with Laplacian variance below this are too blurry for reliable OCR.
-# Giảm từ 25 → 12: crop nhỏ (motorcycle) bao giờ cũng có Laplacian thấp hơn crop lớn.
-_MIN_PLATE_SHARPNESS = 12.0
+_MIN_PLATE_SHARPNESS = 25.0
 
 # Maximum OCR candidates buffered per track for character-level voting.
-# Giảm từ 10 → 5: vote nhanh hơn, phù hợp xe đi qua nhanh.
-_MAX_TRACK_CANDIDATES = 5
+_MAX_TRACK_CANDIDATES = 10
 
 # Mean brightness below this threshold → treat frame as nighttime.
 _NIGHT_BRIGHTNESS_THRESH = 80
@@ -265,7 +250,6 @@ def _normalize_plate(text: str) -> str:
     # e.g. '80A-104462' → '80A-04462'  (OCR reads plate border as extra '1')
     _strip1 = re.sub(r'^([1-9][0-9][A-Z]{1,2}\s?[-.]?\s?)1(\d{4,5})$', r'\1\2', text)
 
-
     variants = [
         text.replace('O', 'D'),   # letter O in series → D  (try first)
         text.replace('O', '0'),   # letter O in digit section → 0
@@ -320,9 +304,7 @@ class PlateOCR(NvDsPyFuncPlugin):
     nms_iou_threshold : float
         IoU threshold for plate NMS (default 0.45).
     ocr_conf_threshold : float
-        Minimum PP-OCRv4 average per-char confidence (default 0.60).
-    ocr_model_path : str
-        Path to PP-OCRv4 mobile rec ONNX file.
+        Minimum PaddleOCR character confidence (default 0.60).
     roi_zones : dict[str, list[int]] | None
         Per-source ROI zones as {source_id: [x1, y1, x2, y2]}.
         Vehicles whose center falls outside the zone are skipped.
@@ -331,35 +313,26 @@ class PlateOCR(NvDsPyFuncPlugin):
 
     def __init__(
         self,
-        plate_model_path: str = "/models/yolov8l_plate/yolov8l_plate.onnx",
-        ocr_model_path:   str = "/models/ppocrv4_rec/ppocrv4_rec.onnx",
+        plate_model_path: str = "/models/yolov8n_plate/yolov8n_plate.onnx",
         plate_conf_threshold: float = 0.50,
         nms_iou_threshold: float = 0.45,
         ocr_conf_threshold: float = 0.60,
         roi_zones: "dict[str, list[int]] | None" = None,
-        direct_plate_cams: "list[str] | None" = None,
-        save_dir: str = _DETECT_BASE_DIR,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.plate_model_path = plate_model_path
-        self.ocr_model_path   = ocr_model_path
         self.plate_conf_threshold = plate_conf_threshold
         self.nms_iou_threshold = nms_iou_threshold
         self.ocr_conf_threshold = ocr_conf_threshold
-        self._detect_base_dir = save_dir
         # {source_id: (x1, y1, x2, y2)}
         self._roi_zones: dict[str, tuple[int, int, int, int]] = {
             k: tuple(v) for k, v in (roi_zones or {}).items()
         }
-        # Cameras that run plate detection on the full frame (không cần vehicle bbox).
-        # Dùng cho camera chĩa thẳng vào biển số — xe gần quá, primary không detect được.
-        self._direct_plate_cams: set[str] = set(direct_plate_cams or [])
 
-        self._ort_session    = None   # YOLOv8l_plate detection
-        self._ocr_session    = None   # PP-OCRv4 rec recognition (ORT — KHÔNG dùng paddleocr library)
-        self._ocr_inp_name   = None
-        self._clahe          = None   # pre-created once in on_start
+        self._ort_session = None
+        self._ocr = None
+        self._clahe = None   # pre-created once in on_start
         self._frame_counts: dict[str, int] = {}
         self._created_dirs: set[str] = set()
         # Per-source: whether the last processed frame contained vehicle detections.
@@ -374,8 +347,6 @@ class PlateOCR(NvDsPyFuncPlugin):
         self._plate_last_saved: dict[tuple, float] = {}
         # NOT_DETECTED throttle: {(source_id, track_id): last_saved_epoch}
         self._not_detected_last_saved: dict[tuple, float] = {}
-        # Direct-mode early-save: {source_id: last_saved_epoch}
-        self._direct_last_saved: dict[str, float] = {}
 
 
         # Background save queue — keeps disk I/O off the pyfunc hot path
@@ -426,11 +397,11 @@ class PlateOCR(NvDsPyFuncPlugin):
 
     def _reorganize_worker(self) -> None:
         """Background worker: scan all source/date dirs and sort flat files."""
-        if not os.path.isdir(self._detect_base_dir):
+        if not os.path.isdir(_DETECT_BASE_DIR):
             return
         moved_total = 0
-        for source in os.listdir(self._detect_base_dir):
-            source_dir = os.path.join(self._detect_base_dir, source)
+        for source in os.listdir(_DETECT_BASE_DIR):
+            source_dir = os.path.join(_DETECT_BASE_DIR, source)
             if not os.path.isdir(source_dir):
                 continue
             for date in os.listdir(source_dir):
@@ -458,35 +429,11 @@ class PlateOCR(NvDsPyFuncPlugin):
             try:
                 save_dir, prefix, vehicle_crop, plate_crop, event = task
                 os.makedirs(save_dir, exist_ok=True)
-                vehicle_path = os.path.join(save_dir, f"{prefix}_vehicle.jpg")
-                plate_path   = os.path.join(save_dir, f"{prefix}_plate.jpg") if plate_crop is not None else None
-                cv2.imwrite(vehicle_path, vehicle_crop)
+                cv2.imwrite(os.path.join(save_dir, f"{prefix}_vehicle.jpg"), vehicle_crop)
                 if plate_crop is not None:
-                    cv2.imwrite(plate_path, plate_crop)
-                # Compute relative path từ /Detect base để FE build URL /api/detect-images/{rel}
-                rel_vehicle = os.path.relpath(vehicle_path, "/Detect") if vehicle_path.startswith("/Detect/") else None
-                rel_plate   = os.path.relpath(plate_path, "/Detect") if (plate_path and plate_path.startswith("/Detect/")) else None
-                event["image_path"]       = rel_vehicle
-                event["plate_image_path"] = rel_plate
+                    cv2.imwrite(os.path.join(save_dir, f"{prefix}_plate.jpg"), plate_crop)
                 with open(os.path.join(save_dir, f"{prefix}.json"), "w") as f:
                     json.dump(event, f, ensure_ascii=False, indent=2)
-                # Ghi vào DB (recognition_logs) với image_path → FE/Dashboard hiển thị
-                if event.get("plate_number"):
-                    try:
-                        from src.business.audit_logger import audit_logger as _audit
-                        _audit.log_recognition_event({
-                            "source_id":        event.get("source_id"),
-                            "camera_id":        event.get("source_id"),
-                            "label":            event.get("label", "vehicle"),
-                            "plate_number":     event.get("plate_number"),
-                            "plate_category":   event.get("plate_category"),
-                            "ocr_confidence":   event.get("ocr_confidence", 0.0),
-                            "image_path":       rel_vehicle,
-                            "plate_image_path": rel_plate,
-                            "timestamp":        event.get("timestamp"),
-                        })
-                    except Exception as exc:
-                        logger.debug("Audit log_recognition_event from LPR failed: %s", exc)
             except Exception as exc:
                 logger.warning("Save worker error: %s", exc)
             finally:
@@ -549,30 +496,29 @@ class PlateOCR(NvDsPyFuncPlugin):
             moved += 1
         return moved
 
-    # PP-OCRv4 mobile rec charset: 96 chars, class 0 = CTC blank.
-    # Thứ tự thực tế của model ppocrv4_rec.onnx:
-    #   class 1-10  : '0'-'9'        (10)
-    #   class 11-17 : 7 placeholder  (7)
-    #   class 18-43 : 'A'-'Z'        (26)
-    #   class 44-49 : 6 placeholder  (6)
-    #   class 50-75 : 'a'-'z'        (26)
-    #   class 76-96 : 21 placeholder (21)  → total 96 = len(charset)
-    # Mapping: class p → _PPOCR_CHARSET[p - 1]   (p=0 là blank, bỏ qua)
-    _PPOCR_CHARSET = list(
-        "0123456789"                          # 1-10   (10)
-        "!\"#$%&'"                            # 11-17  (7)
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"          # 18-43  (26)
-        "[\\]^_`"                             # 44-49  (6)
-        "abcdefghijklmnopqrstuvwxyz"          # 50-75  (26)
-        "{|}~!@#$%^&*()+,-./:;"               # 76-96  (21)
-    )
-
     def _init_models(self):
         import onnxruntime as ort
 
-        os.makedirs(self._detect_base_dir, exist_ok=True)
+        # albumentations (PaddleOCR dependency) imports paths that reference cv2 inpaint
+        # constants; some DeepStream/system cv2 builds omit these module-level attrs.
+        if not hasattr(cv2, "INPAINT_TELEA"):
+            cv2.INPAINT_TELEA = 1
+        if not hasattr(cv2, "INPAINT_NS"):
+            cv2.INPAINT_NS = 2
 
-        # ── Stage 1: YOLOv8l_plate detection ─────────────────────────────────
+        use_gpu_env = os.getenv("PADDLEOCR_USE_GPU", "0").strip().lower()
+        use_gpu = use_gpu_env in {"1", "true", "yes", "y", "on"}
+
+        # Defensive: even with PaddleOCR(use_gpu=False), Paddle GPU wheels may try to
+        # touch CUDA during import/initialization on some setups. Force CPU unless
+        # explicitly enabled.
+        if not use_gpu:
+            os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+            os.environ.setdefault("FLAGS_use_cuda", "0")
+
+        from paddleocr import PaddleOCR
+
+        os.makedirs(_DETECT_BASE_DIR, exist_ok=True)
         logger.info("Loading plate detection model: %s", self.plate_model_path)
         self._ort_session = ort.InferenceSession(
             self.plate_model_path,
@@ -582,8 +528,9 @@ class PlateOCR(NvDsPyFuncPlugin):
         active_provider = self._ort_session.get_providers()[0]
         logger.info("Plate detector using provider: %s", active_provider)
 
-        # Warmup CUDA kernels tránh latency ~900ms frame đầu
-        # (YOLOv8l 175MB compile lâu hơn — warmup đủ 5 lần).
+        # Warm up CUDA kernels so the first real frame does not trigger
+        # 900ms+ compilation latency that fills the GStreamer queue and
+        # causes the ZMQ ACK timeout / ingress crash loop.
         model_sz = self._ort_session.get_inputs()[0].shape[2]
         logger.info("Warming up plate detector (%dx%d) ...", model_sz, model_sz)
         dummy = np.zeros((1, 3, model_sz, model_sz), dtype=np.float32)
@@ -591,91 +538,23 @@ class PlateOCR(NvDsPyFuncPlugin):
             self._ort_session.run(None, {self._input_name: dummy})
         logger.info("Plate detector warmup done.")
 
-        # ── Stage 2: PP-OCRv4 mobile rec (ORT direct, KHÔNG dùng paddleocr lib) ──
-        # Input fixed (1, 3, 48, 320). Output softmax probs (1, T, C) — decode
-        # CTC manually với _PPOCR_CHARSET. Không có angle classifier, biển
-        # nghiêng > 15° có thể sai — trade-off chấp nhận để latency thấp hơn
-        # ~30-50ms/plate so với PaddleOCR library.
-        logger.info("Loading PP-OCRv4 rec model: %s", self.ocr_model_path)
-        self._ocr_session = ort.InferenceSession(
-            self.ocr_model_path,
-            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+        logger.info("Initializing PaddleOCR (lang=en, use_gpu=%s)...", use_gpu)
+        self._ocr = PaddleOCR(
+            use_angle_cls=True,   # classify rotated/tilted plates
+            lang="en",
+            use_gpu=use_gpu,
+            show_log=False,
+            rec_algorithm="SVTR_LCNet",
         )
-        self._ocr_inp_name = self._ocr_session.get_inputs()[0].name
-        ocr_provider = self._ocr_session.get_providers()[0]
-        logger.info("PP-OCRv4 rec using provider: %s", ocr_provider)
-
         self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
 
-        logger.info("Warming up PP-OCRv4 rec ...")
-        dummy_ocr = np.zeros((1, 3, 48, 320), dtype=np.float32)
-        for _ in range(3):
-            self._ocr_session.run(None, {self._ocr_inp_name: dummy_ocr})
-        logger.info("PP-OCRv4 rec warmup done.")
+        # Warm up PaddleOCR (GPU init can be expensive on first call).
+        logger.info("Warming up PaddleOCR ...")
+        dummy_plate = np.zeros((64, 256, 3), dtype=np.uint8)
+        self._ocr(dummy_plate)
+        logger.info("PaddleOCR warmup done.")
 
         logger.info("PlateOCR models ready.")
-
-    def _ppocr_rec(self, img_bgr: np.ndarray) -> tuple[str, float]:
-        """
-        Preprocess + run PP-OCRv4 mobile rec qua ONNX Runtime.
-        Trả về (raw_text, avg_conf).
-
-        Input shape cố định (1, 3, 48, 320):
-          - Resize theo aspect ratio sao cho h=48, w tối đa 320
-          - Nếu w < 320 → right-pad zero
-          - Normalize (x - 127.5) / 127.5
-
-        Decode CTC:
-          - argmax dọc class dim → preds shape (T,)
-          - Skip duplicate (prev==curr) và blank (index 0)
-          - Char = _PPOCR_CHARSET[pred - 1]
-        """
-        # Thêm padding 12% quanh ảnh trước OCR — tránh ký tự ở rìa bị cắt mất
-        # khi YOLO crop plate sát mép (hay gặp với chữ F, 1 ở đầu dòng).
-        pad = max(6, int(img_bgr.shape[0] * 0.12))
-        img_bgr = cv2.copyMakeBorder(
-            img_bgr, pad, pad, pad, pad, cv2.BORDER_REPLICATE
-        )
-        h, w = img_bgr.shape[:2]
-        if h <= 0 or w <= 0:
-            return "", 0.0
-        r = 48.0 / max(h, 1)
-        new_w = min(320, int(w * r))
-        if new_w <= 0:
-            return "", 0.0
-        resized = cv2.resize(img_bgr, (new_w, 48))
-        if new_w < 320:
-            resized = cv2.copyMakeBorder(
-                resized, 0, 0, 0, 320 - new_w,
-                cv2.BORDER_CONSTANT, value=(0, 0, 0),
-            )
-        x = resized.astype(np.float32)
-        x = (x - 127.5) / 127.5
-        x = x.transpose(2, 0, 1)[np.newaxis]       # (1, 3, 48, 320)
-        out = self._ocr_session.run(None, {self._ocr_inp_name: x})[0]   # (1, T, C)
-        probs = out[0]                              # (T, C)
-        preds = probs.argmax(axis=-1)
-
-        # PP-OCRv4 mobile rec: class 0 = CTC blank; class p → _PPOCR_CHARSET[p-1].
-        blank_idx = 0
-
-        chars: list[str] = []
-        confs: list[float] = []
-        prev = -1
-        for t, p in enumerate(preds):
-            p = int(p)
-            if p == prev:
-                prev = p
-                continue
-            if p != blank_idx:
-                idx = p - 1
-                if 0 <= idx < len(self._PPOCR_CHARSET):
-                    chars.append(self._PPOCR_CHARSET[idx])
-                    confs.append(float(probs[t, p]))
-            prev = p
-        text = "".join(chars)
-        conf = float(np.mean(confs)) if confs else 0.0
-        return text, conf
 
     def _detect_plates(
         self, vehicle_bgr: np.ndarray
@@ -684,62 +563,46 @@ class PlateOCR(NvDsPyFuncPlugin):
         Detect plate bounding boxes inside a vehicle crop.
 
         Returns list of (x1, y1, x2, y2, confidence) in vehicle-crop pixels.
-
-        Dùng letterbox resize (giữ aspect ratio, pad đen) thay vì square resize.
-        Square resize làm méo xe rộng/dẹt (truck 586×162 → 1280×1280) khiến
-        plate bị bẹp, YOLO không nhận ra. Letterbox giải quyết vấn đề này.
         """
         h, w = vehicle_bgr.shape[:2]
-        if h == 0 or w == 0:
-            return []
 
-        model_sz = self._ort_session.get_inputs()[0].shape[2]
+        # Preprocess to model input size (read from session, e.g. 640 or 1280)
+        model_sz = self._ort_session.get_inputs()[0].shape[2]  # e.g. 640 or 1280
+        resized = cv2.resize(vehicle_bgr, (model_sz, model_sz))
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        blob = rgb.transpose(2, 0, 1)[np.newaxis]  # [1, 3, model_sz, model_sz]
 
-        # Letterbox: scale theo cạnh lớn hơn, pad cạnh còn lại
-        scale = model_sz / max(h, w)
-        new_h = int(round(h * scale))
-        new_w = int(round(w * scale))
-        resized = cv2.resize(vehicle_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        raw = self._ort_session.run(None, {self._input_name: blob})[0]
 
-        pad_top  = (model_sz - new_h) // 2
-        pad_left = (model_sz - new_w) // 2
-        canvas = np.zeros((model_sz, model_sz, 3), dtype=np.uint8)
-        canvas[pad_top:pad_top + new_h, pad_left:pad_left + new_w] = resized
-
-        rgb  = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        blob = rgb.transpose(2, 0, 1)[np.newaxis]
-
-        raw   = self._ort_session.run(None, {self._input_name: blob})[0]
+        # YOLOv8 output shape: [1, 4+num_classes, num_anchors]
+        # For a single-class plate model: [1, 5, anchors]
         preds = raw[0].T  # [anchors, 5]
 
         scores = preds[:, 4]
-        mask   = scores > self.plate_conf_threshold
+        mask = scores > self.plate_conf_threshold
         if not mask.any():
             return []
 
-        preds  = preds[mask]
+        preds = preds[mask]
         scores = scores[mask]
 
-        # cx,cy,bw,bh trong model_sz space → tính ngược về crop pixels
-        # cần trừ letterbox offset và chia scale
-        cx_m = preds[:, 0];  cy_m = preds[:, 1]
-        bw_m = preds[:, 2];  bh_m = preds[:, 3]
+        # cx, cy, bw, bh in model_sz-space → x1,y1,x2,y2 in vehicle-crop pixels
+        cx = preds[:, 0] / model_sz * w
+        cy = preds[:, 1] / model_sz * h
+        bw = preds[:, 2] / model_sz * w
+        bh = preds[:, 3] / model_sz * h
 
-        cx_c = (cx_m - pad_left) / scale
-        cy_c = (cy_m - pad_top)  / scale
-        bw_c = bw_m / scale
-        bh_c = bh_m / scale
+        x1 = np.clip(cx - bw / 2, 0, w).astype(int)
+        y1 = np.clip(cy - bh / 2, 0, h).astype(int)
+        x2 = np.clip(cx + bw / 2, 0, w).astype(int)
+        y2 = np.clip(cy + bh / 2, 0, h).astype(int)
 
-        x1 = np.clip(cx_c - bw_c / 2, 0, w).astype(int)
-        y1 = np.clip(cy_c - bh_c / 2, 0, h).astype(int)
-        x2 = np.clip(cx_c + bw_c / 2, 0, w).astype(int)
-        y2 = np.clip(cy_c + bh_c / 2, 0, h).astype(int)
-
+        # Filter degenerate boxes
         valid = (x2 > x1) & (y2 > y1)
         if not valid.any():
             return []
 
-        boxes_xyxy  = np.stack([x1[valid], y1[valid], x2[valid], y2[valid]], axis=1)
+        boxes_xyxy = np.stack([x1[valid], y1[valid], x2[valid], y2[valid]], axis=1)
         scores_valid = scores[valid]
 
         keep = _nms(boxes_xyxy.astype(float), scores_valid, self.nms_iou_threshold)
@@ -778,36 +641,35 @@ class PlateOCR(NvDsPyFuncPlugin):
 
     def _ocr_lines(self, img: np.ndarray) -> list[tuple[str, float]]:
         """
-        Run PP-OCRv4 rec on img, return [(text, conf)] (list 0 hoặc 1 phần tử).
-
-        PP-OCRv4 rec CHỈ làm recognition (không detection như PaddleOCR lib),
-        nên gọi 1 lần trả về 1 text. Multi-line plate xử lý ở `_run_ocr_split`
-        bằng cách cắt top-half gọi lại hàm này.
-
-        Filter theo _LINE_DETECT_CONF (0.35) để giữ dim-line trên biển 2-line.
+        Run PaddleOCR on img, return list of (text, conf) sorted top-to-bottom.
+        Uses _LINE_DETECT_CONF (0.40) so dim top-lines on 2-line plates are kept.
         """
-        text, conf = self._ppocr_rec(img)
-        if not text:
+        result = self._ocr.ocr(img, cls=True)
+        if not result or not result[0]:
             return []
-        filtered = "".join(c for c in text.upper() if c in _PLATE_ALLOWED or c == 'O')
-        if filtered and conf >= _LINE_DETECT_CONF:
-            return [(filtered, conf)]
-        return []
+        lines = sorted(result[0], key=lambda ln: ln[0][0][1])
+        out = []
+        for line in lines:
+            _, (text, conf) = line[0], line[1]
+            filtered = "".join(c for c in text.upper() if c in _PLATE_ALLOWED or c == 'O')
+            if filtered and conf >= _LINE_DETECT_CONF:
+                out.append((filtered, conf))
+        return out
 
     def _run_ocr(self, plate_bgr: np.ndarray) -> tuple[Optional[str], float]:
         """
-        Run PP-OCRv4 rec OCR on a plate crop (via ORT, no paddleocr lib).
+        Run PaddleOCR on a plate crop.
 
         Returns (plate_text, confidence), or (None, 0.0) if nothing found.
 
         Strategy:
         1. Upscale to at least 64×160 for reliable OCR.
         2. CLAHE + sharpen preprocessing.
-        3. Full-image rec với per-line threshold 0.35 (lower than final 0.60)
-           để giữ top-line mờ trên biển xe máy 2 dòng.
-        4. Nếu kết quả chỉ có digit (top-line bị miss), fallback split-line:
-           cắt top-half crop → OCR riêng → nối "{top}-{digit}".
-        5. Final avg confidence phải ≥ ocr_conf_threshold (0.60).
+        3. Full-image OCR with per-line threshold 0.40 (lower than final 0.60)
+           so dim top-lines on 2-line motorcycle plates are not dropped.
+        4. If result is digit-only (top line missed), split plate at mid-height
+           and OCR the top half separately as fallback.
+        5. Final average confidence must reach ocr_conf_threshold (0.60).
         """
         if plate_bgr.size == 0:
             return None, 0.0
@@ -822,23 +684,12 @@ class PlateOCR(NvDsPyFuncPlugin):
             )
 
         plate_bgr = self._preprocess_plate(plate_bgr)
-        ph_post, pw_post = plate_bgr.shape[:2]
-        # Biển xe máy 2 dòng (VN) có tỉ lệ gần vuông: h > 0.50 * w.
-        # OCR toàn bộ ảnh sẽ compress 2 dòng xuống ~24px/dòng → garbage.
-        # Ưu tiên split top/bottom trước, rồi mới fallback toàn ảnh.
-        is_two_line = ph_post > pw_post * 0.50
-        if is_two_line:
-            plate_text, avg_conf = self._ocr_two_line(plate_bgr)
-            if plate_text:
-                stripped_len = len(re.sub(r'[-.\s]', '', plate_text))
-                if stripped_len >= 5:
-                    return plate_text, avg_conf
 
-        # Fallback hoặc biển 1 dòng: OCR toàn ảnh
         valid_lines = self._ocr_lines(plate_bgr)
         if not valid_lines:
             return None, 0.0
 
+        # Two-line plate: join top + bottom; one-line: use as-is
         plate_text = "-".join(t for t, _ in valid_lines[:2])
         avg_conf   = sum(c for _, c in valid_lines[:2]) / len(valid_lines[:2])
 
@@ -857,47 +708,6 @@ class PlateOCR(NvDsPyFuncPlugin):
             return None, 0.0
 
         return plate_text, avg_conf
-
-    def _ocr_two_line(self, plate_bgr: np.ndarray) -> tuple[Optional[str], float]:
-        """
-        OCR riêng từng dòng cho biển xe máy 2 dòng (VN):
-          Dòng trên: mã tỉnh + ký tự sê-ri (e.g. "37-M1")
-          Dòng dưới: số (e.g. "07918")
-        Upscale từng nửa lên ít nhất 48px cao → PP-OCRv4 hoạt động tốt hơn.
-        """
-        ph, pw = plate_bgr.shape[:2]
-        # Split tại 45% thay vì 50%: dòng trên VN plate thường chiếm ~40% chiều cao,
-        # dịch xuống thêm 5% để bottom half capture đủ đầu chữ số dòng dưới.
-        mid = int(ph * 0.45)
-
-        top_half = plate_bgr[:mid, :]
-        bot_half = plate_bgr[mid:, :]
-
-        def _ocr_half(half: np.ndarray) -> tuple[str, float]:
-            hh, hw = half.shape[:2]
-            if hh < 24 or hw < 60:
-                return "", 0.0
-            if hh < 64:
-                s = 64.0 / hh
-                half = cv2.resize(half, (int(hw * s), 64), interpolation=cv2.INTER_CUBIC)
-            lines = self._ocr_lines(half)
-            if not lines:
-                return "", 0.0
-            return lines[0]
-
-        top_text, top_conf = _ocr_half(top_half)
-        bot_text, bot_conf = _ocr_half(bot_half)
-
-        if not top_text and not bot_text:
-            return None, 0.0
-
-        parts = [t for t in (top_text, bot_text) if t]
-        combined = "-".join(parts)
-        avg_conf = sum(c for c in (top_conf, bot_conf) if c > 0) / max(sum(1 for c in (top_conf, bot_conf) if c > 0), 1)
-
-        if avg_conf < self.ocr_conf_threshold:
-            return None, 0.0
-        return combined, avg_conf
 
     def _run_ocr_split(
         self, plate_bgr: np.ndarray, digit_text: str, digit_conf: float
@@ -1054,7 +864,7 @@ class PlateOCR(NvDsPyFuncPlugin):
             date_str = now.strftime("%Y-%m-%d")
             ts = now.strftime("%H%M%S_%f")[:10]  # HHMMSSmmm
 
-            save_dir = os.path.join(self._detect_base_dir, source_id, date_str, plate_category)
+            save_dir = os.path.join(_DETECT_BASE_DIR, source_id, date_str, plate_category)
             safe_plate = plate_text.replace("-", "_")
             prefix = f"{ts}_{label}_{safe_plate}"
 
@@ -1103,7 +913,7 @@ class PlateOCR(NvDsPyFuncPlugin):
         try:
             today = datetime.now(_VN_TZ).strftime("%Y-%m-%d")
             ts = datetime.now(_VN_TZ).strftime("%H%M%S_%f")[:10]
-            save_dir = os.path.join(self._detect_base_dir, source_id, today, _NOT_DETECTED_DIR)
+            save_dir = os.path.join(_DETECT_BASE_DIR, source_id, today, _NOT_DETECTED_DIR)
             prefix = f"{ts}_{label}_nd{track_id}"
             vx1, vy1, vx2, vy2 = vehicle_bbox
             event = {
@@ -1131,19 +941,13 @@ class PlateOCR(NvDsPyFuncPlugin):
         if getattr(self, "_disabled", False):
             return
 
-        source_id = frame_meta.source_id
-        is_direct = source_id in self._direct_plate_cams
-
         # Early exit: không có vehicle object → skip toàn bộ, không cần đọc frame.
-        # Ngoại lệ: direct_plate_cams luôn chạy (xe gần quá primary không detect được).
         has_vehicle = any(
             not o.is_primary and o.label in _VEHICLE_LABELS
             for o in getattr(frame_meta, "objects", [])
         )
-
-        self._frame_counts[source_id] = self._frame_counts.get(source_id, 0) + 1
-
-        if not has_vehicle and not is_direct:
+        if not has_vehicle:
+            source_id = frame_meta.source_id
             self._last_had_vehicles[source_id] = False
             return
 
@@ -1155,7 +959,7 @@ class PlateOCR(NvDsPyFuncPlugin):
 
         # Ensure today's output directory exists (Vietnam time)
         today = datetime.now(_VN_TZ).strftime("%Y-%m-%d")
-        day_dir = os.path.join(self._detect_base_dir, frame_meta.source_id, today)
+        day_dir = os.path.join(_DETECT_BASE_DIR, frame_meta.source_id, today)
         if day_dir not in self._created_dirs:
             os.makedirs(day_dir, exist_ok=True)
             self._created_dirs.add(day_dir)
@@ -1163,6 +967,8 @@ class PlateOCR(NvDsPyFuncPlugin):
 
         # Run LPR every N frames normally, but process every frame when
         # vehicles were detected in the previous frame to avoid missing plates.
+        source_id = frame_meta.source_id
+        self._frame_counts[source_id] = self._frame_counts.get(source_id, 0) + 1
         skip = self._skip_factors.get(source_id, self._default_skip_factor)
         had_vehicles = self._last_had_vehicles.get(source_id, False)
         if not had_vehicles and self._frame_counts[source_id] % skip != 0:
@@ -1190,85 +996,6 @@ class PlateOCR(NvDsPyFuncPlugin):
         roi = self._roi_zones.get(source_id)
         now = time.monotonic()
         self._flush_expired_tracks(source_id, now)
-
-        # ── Direct plate cam: chạy ORT detect thẳng trên full frame ──────────
-        # Camera chĩa thẳng vào biển — xe quá gần, primary không detect vehicle.
-        if is_direct and not has_vehicle:
-            skip = self._skip_factors.get(source_id, self._default_skip_factor)
-            if self._frame_counts[source_id] % max(skip, 3) != 0:
-                return   # process 1/3 frames để giảm tải
-
-            plates = self._detect_plates(frame_bgr)
-            if not plates:
-                return
-
-            plates.sort(key=lambda p: p[4], reverse=True)
-            px1, py1, px2, py2, pconf = plates[0]
-            plate_crop = frame_bgr[py1:py2, px1:px2]
-            sharp = _sharpness(plate_crop)
-            logger.debug("Direct LPR [%s] — plate detected conf=%.3f bbox=(%d,%d,%d,%d) sharpness=%.1f",
-                           source_id, pconf, px1, py1, px2, py2, sharp)
-
-            track = self._match_or_create_track(
-                source_id, (0, 0, fw, fh), "direct", now,
-            )
-            if sharp < _MIN_PLATE_SHARPNESS:
-                return
-
-            plate_text, ocr_conf = self._run_ocr(plate_crop)
-            if plate_text:
-                plate_text = _normalize_plate(plate_text)
-            if plate_text and ocr_conf >= self.ocr_conf_threshold:
-                plate_category = _classify_plate(plate_text)
-                track.update_best(
-                    plate=plate_text,
-                    plate_category=plate_category,
-                    ocr_conf=ocr_conf,
-                    det_conf=pconf,
-                    vehicle_crop=frame_bgr,
-                    plate_crop=plate_crop,
-                    vehicle_bbox=(0, 0, fw, fh),
-                    plate_bbox=(px1, py1, px2, py2),
-                )
-                logger.info(
-                    "Direct LPR [%s] plate='%s' cat=%s conf=%.2f",
-                    source_id, plate_text, plate_category, ocr_conf,
-                )
-
-                # Early-save trong direct mode: không chờ track expire.
-                # Khi đủ candidates VÀ đã qua _DIRECT_SAVE_INTERVAL kể từ lần lưu trước.
-                n_cands = len(track.ocr_candidates)
-                last_direct = self._direct_last_saved.get(source_id, 0.0)
-                if n_cands >= _DIRECT_SAVE_MIN_CANDIDATES and now - last_direct >= _DIRECT_SAVE_INTERVAL:
-                    voted_text, voted_conf = _vote_plate(track.ocr_candidates)
-                    if voted_text:
-                        voted_text = _normalize_plate(voted_text)
-                    if voted_text and voted_conf >= self.ocr_conf_threshold:
-                        dedup_key = (source_id, voted_text)
-                        last_saved = self._plate_last_saved.get(dedup_key, 0.0)
-                        if now - last_saved >= _PLATE_DEDUP_SECS:
-                            voted_cat = _classify_plate(voted_text)
-                            self._save_crops(
-                                source_id=source_id,
-                                label="direct",
-                                plate_text=voted_text,
-                                vehicle_crop=track.best_vehicle_crop,
-                                plate_crop=track.best_plate_crop,
-                                vehicle_bbox=track.best_vehicle_bbox,
-                                plate_bbox=track.best_plate_bbox,
-                                ocr_conf=voted_conf,
-                                plate_det_conf=track.best_det_conf,
-                                plate_category=voted_cat,
-                            )
-                            self._plate_last_saved[dedup_key] = now
-                            self._direct_last_saved[source_id] = now
-                            # Reset candidates để vote mới cho lần save tiếp theo
-                            track.ocr_candidates.clear()
-                            logger.info(
-                                "Direct LPR [%s] early-save voted='%s' cat=%s conf=%.2f (after %d reads)",
-                                source_id, voted_text, voted_cat, voted_conf, n_cands,
-                            )
-            return
 
         vehicle_objects = [
             o for o in frame_meta.objects
@@ -1311,60 +1038,21 @@ class PlateOCR(NvDsPyFuncPlugin):
                 if not (roi[0] <= cx <= roi[2] and roi[1] <= cy <= roi[3]):
                     continue
 
-            bw_v = x2 - x1
-            bh_v = y2 - y1
+            vehicle_crop = frame_bgr[y1:y2, x1:x2]
 
-            # Edge-clip filter: bbox chạm ≥2 mép = xe đang vào/ra frame, primary
-            # đã clip mất phần bên kia → không thể crop đầy đủ. Skip, đợi
-            # tracker frame sau khi xe vào trọn vẹn.
-            edge_clip = (x1 <= 1) + (y1 <= 1) + (x2 >= fw - 1) + (y2 >= fh - 1)
-            if edge_clip >= 2:
-                continue
-            # Bbox quá thấp (xe bị clip ở mép trên/dưới) → biển số cũng không
-            # còn trong khung. 80px là ngưỡng tối thiểu để chứa được biển ô tô.
-            if bh_v < 80:
-                continue
-
-            # Crop "shift-into-frame": cửa sổ kích thước cố định 1.6×bbox bao
-            # quanh tâm bbox, dịch xuống 5% (biển số thiên dưới). Khi tâm sát
-            # mép, cửa sổ DỊCH ngược vào trong frame thay vì cắt mất padding
-            # phía bên kia → vehicle luôn ở giữa khung crop.
-            target_w = int(bw_v * 1.6)
-            target_h = int(bh_v * 1.7)
-            target_w = min(target_w, fw)
-            target_h = min(target_h, fh)
-            cx = (x1 + x2) // 2
-            cy = int(y1 + bh_v * 0.55)   # bias xuống dưới để chừa chỗ biển số
-
-            ex1 = cx - target_w // 2
-            ey1 = cy - target_h // 2
-            ex2 = ex1 + target_w
-            ey2 = ey1 + target_h
-
-            # Slide window vào trong frame — giữ nguyên kích thước cửa sổ.
-            if ex1 < 0:    ex2 -= ex1; ex1 = 0
-            if ey1 < 0:    ey2 -= ey1; ey1 = 0
-            if ex2 > fw:   ex1 -= (ex2 - fw); ex2 = fw
-            if ey2 > fh:   ey1 -= (ey2 - fh); ey2 = fh
-            ex1 = max(0, ex1)
-            ey1 = max(0, ey1)
-            crop_off_x = ex1   # offset để convert plate bbox về frame space
-            crop_off_y = ey1
-
-            vehicle_crop = frame_bgr[ey1:ey2, ex1:ex2]
-
-            # Ưu tiên sGIE: lọc plate có bbox nằm trong vehicle này (dùng vùng
-            # expanded). Coords sGIE đã ở frame space.
+            # Ưu tiên sGIE: lọc plate có bbox nằm trong vehicle này.
+            # Coords sGIE đã ở frame space (converter cộng roi_left/roi_top).
             plates: list[tuple[int, int, int, int, float]] = []
             for (gx1, gy1, gx2, gy2, pconf) in sgie_plates:
                 pcx = (gx1 + gx2) // 2
                 pcy = (gy1 + gy2) // 2
-                if ex1 <= pcx <= ex2 and ey1 <= pcy <= ey2:
+                if x1 <= pcx <= x2 and y1 <= pcy <= y2:
+                    # Convert về crop space — consumer cắt plate từ vehicle_crop
                     plates.append((
-                        max(0, gx1 - ex1),
-                        max(0, gy1 - ey1),
-                        min(ex2 - ex1, gx2 - ex1),
-                        min(ey2 - ey1, gy2 - ey1),
+                        max(0, gx1 - x1),
+                        max(0, gy1 - y1),
+                        min(x2 - x1, gx2 - x1),
+                        min(y2 - y1, gy2 - y1),
                         pconf,
                     ))
 
@@ -1400,7 +1088,6 @@ class PlateOCR(NvDsPyFuncPlugin):
             plate_crop = vehicle_crop[py1:py2, px1:px2]
 
             # Use DeepStream track_id if tracker is active, else center-distance match
-            # vehicle_bbox dùng bbox gốc (không expanded) để JSON sidecar đúng frame coords
             track = self._match_or_create_track(
                 source_id, (x1, y1, x2, y2), obj_meta.label, now,
                 ds_track_id=obj_meta.track_id,
@@ -1448,8 +1135,7 @@ class PlateOCR(NvDsPyFuncPlugin):
                 except Exception:
                     pass
 
-                # Buffer best result — save happens once when track expires.
-                # vehicle_crop là expanded crop; plate_bbox coords đã ở crop space.
+                # Buffer best result — save happens once when track expires
                 track.update_best(
                     plate=plate_text,
                     plate_category=plate_category,

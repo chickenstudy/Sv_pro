@@ -10,6 +10,9 @@ import EventsPage from './pages/EventsPage'
 import AlertsPage from './pages/AlertsPage'
 import StrangersPage from './pages/StrangersPage'
 import SettingsPage from './pages/SettingsPage'
+import LprPage from './pages/LprPage'
+import BehaviorPage from './pages/BehaviorPage'
+import ReportsPage from './pages/ReportsPage'
 import AppShell from './components/AppShell'
 import './index.css'
 
@@ -50,6 +53,9 @@ export default function App() {
           <Route path="events" element={<EventsPage />} />
           <Route path="alerts" element={<AlertsPage />} />
           <Route path="strangers" element={<StrangersPage />} />
+          <Route path="lpr" element={<LprPage />} />
+          <Route path="behavior" element={<BehaviorPage />} />
+          <Route path="reports" element={<ReportsPage />} />
           <Route path="settings" element={<SettingsPage />} />
           <Route path="login" element={<Navigate to="/" replace />} />
           <Route path="*" element={<Navigate to="/" replace />} />

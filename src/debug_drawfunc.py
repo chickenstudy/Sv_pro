@@ -20,7 +20,10 @@ class DebugDrawFunc(NvDsDrawFunc):
         frame_w, frame_h = artist.frame_wh
 
         for obj_meta in frame_meta.objects:
-            bbox = obj_meta.bbox
+            try:
+                bbox = obj_meta.bbox
+            except Exception:
+                continue
 
             # bbox coords are already in pixels (converter scales to ROI/frame space)
             pixel_left = max(0.0, bbox.left)

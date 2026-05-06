@@ -32,6 +32,7 @@ _L1_BLACKLIST_TTL  = 60.0      # 1 phút — cập nhật tương đối nhanh
 _L1_CAPACITY       = 500       # Số entity tối đa trong L1 cache
 _REDIS_BL_TTL      = 300       # 5 phút trong Redis
 _NORMAL_LOG_INTERVAL = 60.0    # 60s throttle DB insert cho normal events (giảm spam)
+_BEHAVIOR_LOG_INTERVAL = 60.0  # 60s dedup cho behavior events (fighting/tamper/fallen) per source
 
 
 class Severity(Enum):
@@ -510,6 +511,9 @@ class BlacklistPyfunc(NvDsPyFuncPlugin):
         self._audit_logger = None
         self._telemetry = None
         self._last_normal_log: dict[str, float] = {}
+        # Dedup cho behavior events (fighting/tamper) — tránh ghi AuditLogger mỗi frame
+        # khi last_result của FightingDetector/TamperDetector vẫn True nhiều frame liên tiếp.
+        self._behavior_last_logged: dict[str, float] = {}
         # Redis client dùng để pub detections cho live overlay FE
         self._redis_pub = None
 
@@ -614,6 +618,10 @@ class BlacklistPyfunc(NvDsPyFuncPlugin):
             self._process_frame_safe(frame_meta)
         except Exception as exc:
             logger.warning("Business logic error: %s", exc)
+        try:
+            self._process_behavior_alerts(frame_meta)
+        except Exception as exc:
+            logger.warning("Behavior alert processing error: %s", exc)
         # Publish detection metadata to Redis pub/sub → FE overlay consumes
         # qua backend WebSocket. Chạy ngoài try-safe để không chặn pipeline
         # nếu Redis tạm thời không reachable.
@@ -755,6 +763,99 @@ class BlacklistPyfunc(NvDsPyFuncPlugin):
         except Exception as exc:
             logger.debug("Redis publish failed: %s", exc)
 
+    def _process_behavior_alerts(self, frame_meta: NvDsFrameMeta) -> None:
+        """
+        Đọc tag "behavior_alerts" do BehaviorPyfunc ghi, tạo BlacklistEvent
+        cho fighting / camera_tamper / covered_person / fallen / falling
+        rồi forward vào AuditLogger + AlertManager.
+
+        AuditLogger không có rate-limit nên cần dedup ở đây: mỗi event_type
+        per source_id chỉ được ghi tối đa 1 lần / _BEHAVIOR_LOG_INTERVAL giây.
+        AlertManager đã có rate_secs riêng nên vẫn gọi bình thường.
+        """
+        try:
+            raw = frame_meta.get_tag("behavior_alerts")
+            if not raw:
+                return
+            import json as _json
+            data = _json.loads(raw)
+        except Exception:
+            return
+
+        source_id = str(getattr(frame_meta, "source_id", "unknown"))
+        ts = datetime.now(_VN_TZ).isoformat()
+        now_mono = time.monotonic()
+
+        def _should_log(event_key: str) -> bool:
+            """Trả về True nếu event này chưa được log trong _BEHAVIOR_LOG_INTERVAL."""
+            last = self._behavior_last_logged.get(event_key, 0.0)
+            if now_mono - last >= _BEHAVIOR_LOG_INTERVAL:
+                self._behavior_last_logged[event_key] = now_mono
+                return True
+            return False
+
+        # ── Fighting ──────────────────────────────────────────────────────────
+        if data.get("fighting"):
+            conf = data.get("fight_confidence", 0.0)
+            ev = BlacklistEvent(
+                event_type  = "fighting",
+                entity_type = "behavior",
+                entity_id   = source_id,
+                entity_name = f"Camera {source_id}",
+                severity    = Severity.HIGH,
+                camera_id   = source_id,
+                source_id   = source_id,
+                reason      = f"Phát hiện đánh nhau (confidence: {conf:.0%})",
+                timestamp   = ts,
+                extra       = {"confidence": conf},
+            )
+            if self._audit_logger and _should_log(f"fighting_{source_id}"):
+                self._audit_logger.log_blacklist_event(ev)
+            if self._alert_manager:
+                self._alert_manager.send_alert(ev, image=None)
+
+        # ── Camera Tamper ─────────────────────────────────────────────────────
+        if data.get("tampered"):
+            conf = data.get("tamper_confidence", 0.0)
+            ev = BlacklistEvent(
+                event_type  = "camera_tamper",
+                entity_type = "behavior",
+                entity_id   = source_id,
+                entity_name = f"Camera {source_id}",
+                severity    = Severity.HIGH,
+                camera_id   = source_id,
+                source_id   = source_id,
+                reason      = f"Camera bị che/tamper (confidence: {conf:.0%})",
+                timestamp   = ts,
+                extra       = {"confidence": conf},
+            )
+            if self._audit_logger and _should_log(f"camera_tamper_{source_id}"):
+                self._audit_logger.log_blacklist_event(ev)
+            if self._alert_manager:
+                self._alert_manager.send_alert(ev, image=None)
+
+        # ── Object-level: covered_person / fallen / falling ───────────────────
+        for obj in data.get("behavior_objects", []):
+            label = obj.get("label", "")
+            conf  = obj.get("confidence", 0.0)
+            bbox  = obj.get("bbox")
+            ev = BlacklistEvent(
+                event_type  = label,
+                entity_type = "behavior",
+                entity_id   = source_id,
+                entity_name = f"Camera {source_id}",
+                severity    = Severity.HIGH if label in ("fallen", "covered_person") else Severity.MEDIUM,
+                camera_id   = source_id,
+                source_id   = source_id,
+                reason      = f"Phát hiện {label} (confidence: {conf:.0%})",
+                timestamp   = ts,
+                extra       = {"confidence": conf, "bbox": bbox},
+            )
+            if self._audit_logger and _should_log(f"{label}_{source_id}"):
+                self._audit_logger.log_blacklist_event(ev)
+            if self._alert_manager:
+                self._alert_manager.send_alert(ev, image=None)
+
     def _process_frame_safe(self, frame_meta: NvDsFrameMeta) -> None:
         source_id = str(getattr(frame_meta, "source_id", "unknown"))
         now = time.monotonic()
@@ -792,21 +893,8 @@ class BlacklistPyfunc(NvDsPyFuncPlugin):
                         self._audit_logger.log_blacklist_event(ev, plate_crop=None)
                     if self._alert_manager:
                         self._alert_manager.send_alert(ev, image=None)
-                else:
-                    # Normal recognition log (throttled)
-                    log_key = f"vehicle_{source_id}_{plate_number}"
-                    if now - self._last_normal_log.get(log_key, 0.0) > _NORMAL_LOG_INTERVAL:
-                        self._last_normal_log[log_key] = now
-                        if self._audit_logger:
-                            self._audit_logger.log_recognition_event({
-                                "source_id": source_id,
-                                "camera_id": source_id,
-                                "label": obj_meta.label,
-                                "plate_number": plate_number,
-                                "plate_category": plate_category,
-                                "ocr_confidence": getattr(plate_attr, 'confidence', 0.0),
-                                "timestamp": datetime.now(_VN_TZ).isoformat(),
-                            })
+                # Normal LPR recognition log do plate_ocr._save_worker tự ghi
+                # (kèm image_path đầy đủ) — không cần log lại ở đây để tránh duplicate.
 
             # --- FR observation ---
             person_id = None

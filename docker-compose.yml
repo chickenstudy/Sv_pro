@@ -112,6 +112,13 @@ services:
       - GO2RTC_RTSP_BASE=rtsp://svpro-go2rtc:8554
       # Port cho Enrollment HTTP Service (chạy trong thread riêng của AI Core)
       - ENROLLMENT_PORT=8090
+      # Behavior analytics thresholds (overridable per-deployment)
+      - BEHAVIOR_FIGHTING_THRESHOLD=${BEHAVIOR_FIGHTING_THRESHOLD:-0.6}
+      - BEHAVIOR_TAMPER_THRESHOLD=${BEHAVIOR_TAMPER_THRESHOLD:-0.7}
+      # API key để AI Core POST notify-recognition vào backend (phải khớp INTERNAL_API_KEY của backend)
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY:-svpro-internal-api-key-change-in-production}
+      # OCR: PP-OCRv4 ONNX chạy GPU via onnxruntime-gpu CUDAExecutionProvider
+      # (KHÔNG còn dùng PADDLEOCR_USE_GPU — paddleocr library đã gỡ khỏi image).
     command: /opt/savant/user_data/module/module.yml
     deploy:
       resources:

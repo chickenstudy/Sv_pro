@@ -90,10 +90,13 @@ _running = True
 _pts_counters: dict[str, int] = {}
 _PTS_TIME_BASE = (1, 1_000_000)  # 1 µs per unit
 
-# ZMQ socket KHÔNG thread-safe — nhiều StreamWorker thread gọi send_multipart()
-# đồng thời trên cùng 1 socket → message interleaving / segfault.
-# Lock này serialize tất cả ZMQ writes về một thread tại một thời điểm.
-_zmq_lock = threading.Lock()
+# ZMQ socket KHÔNG thread-safe. Trước đây dùng 1 socket dùng chung + _zmq_lock
+# để serialize writes, nhưng lock gây contention khi nhiều camera (mỗi thread
+# ingress block nhau khi send_multipart).
+#
+# Giải pháp: mỗi StreamWorker tự tạo PUB socket riêng, cùng connect về endpoint.
+# ZMQ hỗ trợ nhiều PUB → 1 SUB (SUB nhận hết frame từ mọi PUB). Không cần lock
+# vì mỗi socket chỉ có 1 thread ghi vào.
 
 
 def _sighandler(sig, _frame):
@@ -122,12 +125,11 @@ class StreamWorker:
     _thread:    Optional[threading.Thread] = field(default=None, repr=False)
     _stop_event: threading.Event            = field(default_factory=threading.Event, repr=False)
 
-    def start(self, zmq_publisher) -> None:
-        """Khởi động worker thread đọc RTSP và push ZMQ."""
+    def start(self) -> None:
+        """Khởi động worker thread đọc RTSP và push ZMQ (tự tạo socket riêng)."""
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._run,
-            args=(zmq_publisher,),
             daemon=True,
             name=f"rtsp-{self.config.source_id}",
         )
@@ -141,7 +143,7 @@ class StreamWorker:
             self._thread.join(timeout=5.0)
         log.info("⏹ Stream worker stopped: [%s]", self.config.source_id)
 
-    def _run(self, zmq_publisher) -> None:
+    def _run(self) -> None:
         """
         Vòng lặp đọc frame từ RTSP go2rtc và push vào ZMQ.
 
@@ -152,7 +154,21 @@ class StreamWorker:
           - Worker KHÔNG bao giờ tự exit — luôn loop chờ cam quay lại,
             cho đến khi StreamManager.sync() thấy cam bị disabled/xóa khỏi DB
             và gọi stop().
+
+        Per-worker ZMQ PUB socket: mỗi worker tạo 1 socket riêng → không
+        contention với worker khác.
         """
+        zmq_publisher = _create_pub_socket(self.config.source_id)
+        try:
+            self._run_loop(zmq_publisher)
+        finally:
+            if zmq_publisher is not None:
+                try:
+                    zmq_publisher.close(linger=0)
+                except Exception:
+                    pass
+
+    def _run_loop(self, zmq_publisher) -> None:
         frame_interval = 1.0 / max(TARGET_FPS, 1)
         last_frame_time = 0.0
         cap: Optional[cv2.VideoCapture] = None
@@ -230,9 +246,18 @@ def _push_frame_zmq(publisher, source_id: str, frame) -> None:
     if publisher is None:
         return
     try:
+        # CRITICAL: Savant pipeline (module.yml parameters.frame = 2592×1944)
+        # dùng nvstreammux capsfilter fixed shape. Frame khác size bị reject
+        # → chỉ cam có đúng resolution đi qua, cam khác stall.
+        # Fix: resize mọi frame về SHARED_FRAME_SIZE trước khi push ZMQ →
+        # Savant nhận 1 shape duy nhất cho mọi source_id.
+        SHARED_W, SHARED_H = 1920, 1080
+        fh, fw = frame.shape[:2]
+        if fw != SHARED_W or fh != SHARED_H:
+            interp = cv2.INTER_AREA if (fw * fh) > (SHARED_W * SHARED_H) else cv2.INTER_LINEAR
+            frame = cv2.resize(frame, (SHARED_W, SHARED_H), interpolation=interp)
         h, w = frame.shape[:2]
 
-        # Encode JPEG (quality 85 — đủ cho AI, tiết kiệm băng thông ZMQ)
         # JPEG quality 92 (tăng từ 85): giữ chi tiết face tốt hơn, không bị
         # artifact blocking. CPU encode chỉ tăng ~10%, trade-off tốt cho
         # ảnh face save cuối cùng rõ nét hơn (chain lossy JPEG 92 + 95 < 85+95).
@@ -267,16 +292,15 @@ def _push_frame_zmq(publisher, source_id: str, frame) -> None:
             time_base=_PTS_TIME_BASE,
         )
 
-        # Serialize → protobuf bytes → gửi ZMQ multipart
-        # Lock bắt buộc: ZMQ socket không thread-safe, mỗi StreamWorker
-        # chạy trên thread riêng và gọi hàm này đồng thời.
+        # Serialize → protobuf bytes → gửi ZMQ multipart.
+        # Không cần lock vì mỗi StreamWorker sở hữu PUB socket riêng, chỉ có
+        # 1 thread ghi vào socket đó.
         log.debug("[%s] Serializing SavantMessage", source_id)
         msg = SavantMessage.video_frame(vf)
         data = save_message(msg)
-        with _zmq_lock:
-            log.debug("[%s] Sending ZMQ multipart", source_id)
-            publisher.send_multipart([source_id.encode(), data])
-            log.debug("[%s] Finished ZMQ send", source_id)
+        log.debug("[%s] Sending ZMQ multipart", source_id)
+        publisher.send_multipart([source_id.encode(), data])
+        log.debug("[%s] Finished ZMQ send", source_id)
 
     except Exception as exc:
         log.debug("[%s] ZMQ push error: %s", source_id, exc)
@@ -292,8 +316,9 @@ class StreamManager:
     Khi camera bị xóa → dừng worker tương ứng.
     """
 
-    def __init__(self, zmq_publisher):
-        self._zmq_publisher = zmq_publisher
+    def __init__(self):
+        # Mỗi StreamWorker tự tạo PUB socket riêng khi start() → không cần
+        # shared publisher ở manager nữa.
         self._workers: dict[str, StreamWorker] = {}
         self._lock = threading.Lock()
 
@@ -311,7 +336,7 @@ class StreamManager:
             for sid in desired - current:
                 cfg = StreamConfig(source_id=sid, rtsp_url=active_streams[sid])
                 worker = StreamWorker(config=cfg)
-                worker.start(self._zmq_publisher)
+                worker.start()
                 self._workers[sid] = worker
                 log.info("📹 Worker added for stream: [%s]", sid)
 
@@ -531,33 +556,54 @@ def listen_loop(manager: StreamManager) -> None:
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
-def _init_zmq():
+# ZMQ Context dùng chung — ZMQ khuyến cáo 1 context per process, các socket
+# sinh ra trên cùng context có thể thuộc thread khác nhau.
+_zmq_ctx = None
+_zmq_ctx_lock = threading.Lock()
+
+
+def _get_zmq_context():
+    global _zmq_ctx
+    if _zmq_ctx is not None:
+        return _zmq_ctx
+    with _zmq_ctx_lock:
+        if _zmq_ctx is None:
+            try:
+                import zmq
+                _zmq_ctx = zmq.Context.instance()
+            except ImportError:
+                log.warning("pyzmq not installed — ZMQ push disabled. Install: pip install pyzmq")
+                return None
+    return _zmq_ctx
+
+
+def _create_pub_socket(source_id: str):
     """
-    Khởi tạo ZMQ PUB socket để push frames vào Savant AI Core.
+    Tạo PUB socket mới cho 1 StreamWorker.
 
     Pattern: AI Core SUB binds (tạo endpoint) → rtsp_ingest PUB connects.
     Sau khi connect phải sleep ~500ms để ZMQ subscription propagate
     (tránh "slow joiner syndrome" — các frame đầu tiên bị drop).
+
+    Mỗi source_id có socket riêng → không contention với worker khác khi gửi.
     """
+    ctx = _get_zmq_context()
+    if ctx is None:
+        return None
     try:
         import zmq
-        ctx = zmq.Context()
         sock = ctx.socket(zmq.PUB)
         if "connect" in ZMQ_PUB_ENDPOINT:
             addr = ZMQ_PUB_ENDPOINT.replace("pub+connect:", "")
             sock.connect(addr)
-            # Slow-joiner fix: chờ subscription propagate trước khi gửi frame đầu
             time.sleep(0.5)
         else:
             addr = ZMQ_PUB_ENDPOINT.replace("pub+bind:", "")
             sock.bind(addr)
-        log.info("ZMQ PUB socket ready: %s", ZMQ_PUB_ENDPOINT)
+        log.info("[%s] ZMQ PUB socket ready: %s", source_id, ZMQ_PUB_ENDPOINT)
         return sock
-    except ImportError:
-        log.warning("pyzmq not installed — ZMQ push disabled. Install: pip install pyzmq")
-        return None
     except Exception as exc:
-        log.error("ZMQ init failed: %s — frames will not be pushed.", exc)
+        log.error("[%s] ZMQ socket init failed: %s", source_id, exc)
         return None
 
 
@@ -575,8 +621,11 @@ def main():
     # Chờ cameras xuất hiện trong DB (tránh race với DB migration startup)
     _wait_for_streams()
 
-    zmq_pub = _init_zmq()
-    manager = StreamManager(zmq_publisher=zmq_pub)
+    # Mỗi StreamWorker tự tạo PUB socket riêng. Gọi _get_zmq_context() sớm
+    # để fail-fast khi pyzmq thiếu (thay vì phát hiện lần gửi frame đầu).
+    if _get_zmq_context() is None:
+        log.error("ZMQ context unavailable — frames sẽ không được push.")
+    manager = StreamManager()
 
     try:
         listen_loop(manager)

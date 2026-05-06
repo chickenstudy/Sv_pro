@@ -3,8 +3,12 @@ name: sv-pro-high-performance-pipeline
 # ── Global Parameters ────────────────────────────────────────────────────────
 parameters:
   frame:
-    width: 2592
-    height: 1944
+    # 1920×1080 = shape CHUNG mà rtsp_ingest.py resize về trước khi push ZMQ.
+    # Mọi camera khác resolution (1280×720, 2592×1944, 1080×1920) được
+    # resize về shape này → nvstreammux capsfilter không reject → 4 cam đồng
+    # thời xử lý qua pipeline. Trước đây 2592×1944 chỉ cam_online_1 match.
+    width: 1920
+    height: 1080
   output_frame:
     # WSL2 mode: raw-rgb24 (no NVENC)
     # Linux production: codec: h264, encoder: nvenc
@@ -15,6 +19,22 @@ parameters:
   buffer_queues:
     length: 20        # Giới hạn buffer trong pipeline
     byte_size: 0
+
+  # ── nvstreammux tuning ──────────────────────────────────────────────────────
+  # Mục đích: nvstreammux gom frame từ N source thành batch trước khi đẩy vào
+  # nvinfer. Tinh chỉnh theo số camera + TARGET_FPS để cân throughput/latency:
+  #
+  #   batch_size              = N (số camera active đồng thời).
+  #   batched_push_timeout µs = 1e6 / TARGET_FPS / 2  (nửa frame period).
+  #
+  # Với 4 camera @ 15 FPS:
+  #   batch_size = 4  → nvinfer xử lý 4 frame từ 4 source trong 1 CUDA call
+  #   batched_push_timeout = 40_000 (40ms) — nếu không gom đủ 4 frame trong
+  #     40ms (camera trễ, mất frame), vẫn flush để tránh stall pipeline.
+  #
+  # Default Savant (2_000_000 = 2s) quá dài → camera lag gây latency khủng.
+  batch_size: 4
+  batched_push_timeout: 40000
 
   # ── ZMQ Backpressure Config ──────────────────────────────────────────────────
   zmq:
@@ -92,16 +112,224 @@ pipeline:
         ll-config-file: /opt/savant/user_data/tracker/config_tracker_NvSORT.yml
         display-tracking-id: true
 
-    # ── Stage 2a: License Plate Recognition (LPR) ─────────────────────────────
-    # Kích hoạt cho các object thuộc nhóm Vehicle
+    # ── Stage 1c: Fall Detector (fallen / falling / standing) ────────────────
+    - element: nvinfer@complex_model
+      name: fall_detector
+      model:
+        format: onnx
+        model_file: /models/fall_detector/fall_detector.onnx
+        batch_size: 4
+        input:
+          layer_name: images
+          shape: [3, 640, 640]
+          scale_factor: 0.0039215697906911373
+        output:
+          layer_names:
+            - output0
+          converter:
+            module: src.converters.generic_yolov8_converter
+            class_name: GenericYOLOv8Converter
+            kwargs:
+              confidence_threshold: 0.3
+              nms_iou_threshold: 0.45
+          num_detected_classes: 3
+          objects:
+            - class_id: 0
+              label: fallen
+              selector:
+                module: savant.selector.detector
+                class_name: BBoxSelector
+                kwargs:
+                  confidence_threshold: 0.4
+            - class_id: 1
+              label: falling
+              selector:
+                module: savant.selector.detector
+                class_name: BBoxSelector
+                kwargs:
+                  confidence_threshold: 0.4
+            - class_id: 2
+              label: standing
+              selector:
+                module: savant.selector.detector
+                class_name: BBoxSelector
+                kwargs:
+                  confidence_threshold: 0.5
+          attributes: []
+
+    # ── Stage 1d: Covered Person Detector (person / covered_person) ───────────
+    - element: nvinfer@complex_model
+      name: covered_person_detector
+      model:
+        format: onnx
+        model_file: /models/covered_person/covered_person_detector.onnx
+        batch_size: 4
+        input:
+          layer_name: images
+          shape: [3, 640, 640]
+          scale_factor: 0.0039215697906911373
+        output:
+          layer_names:
+            - output0
+          converter:
+            module: src.converters.generic_yolov8_converter
+            class_name: GenericYOLOv8Converter
+            kwargs:
+              confidence_threshold: 0.3
+              nms_iou_threshold: 0.45
+          num_detected_classes: 2
+          objects:
+            - class_id: 0
+              label: person
+              selector:
+                module: savant.selector.detector
+                class_name: BBoxSelector
+                kwargs:
+                  confidence_threshold: 0.5
+            - class_id: 1
+              label: covered_person
+              selector:
+                module: savant.selector.detector
+                class_name: BBoxSelector
+                kwargs:
+                  confidence_threshold: 0.4
+          attributes: []
+
+    # ── Stage 2a-pre: Plate Detector sGIE ─────────────────────────────────────
+    # Chạy YOLOv8n-plate thẳng trên GPU (TensorRT FP16), operate trên crop
+    # của object "car" do primary YOLOv8s detect. Xuất object con label "plate"
+    # để PlateOCR pyfunc phía sau chỉ cần đọc bbox và chạy OCR, không phải
+    # chạy ORT CUDAExecutionProvider 1 lần nữa.
+    #
+    # NOTE: plate detector hiện chỉ chạy trên "car". Để phủ motorcycle/bus/truck
+    # cần copy paste thêm stanza với input.object khác, hoặc dùng class ID list
+    # qua extra properties. Giữ đơn giản trước — đa số plate là xe hơi.
+    - element: nvinfer@complex_model
+      name: plate_detector_sgie
+      model:
+        format: onnx
+        # ⚠ YOLOv8l_plate = 175 MB. TRT compile lần đầu ~15-25 phút (cache sau
+        # vào models/engine/). Batch_size giảm 16 → 8 vì model lớn — activations
+        # chiếm ~4-5 GB VRAM nếu batch 16 → RTX 3060 có thể OOM.
+        model_file: /models/yolov8l_plate/yolov8l_plate.onnx
+        # ONNX export với input fixed 1280×1280 (verified onnxruntime). Nếu set
+        # shape=640 → TRT báo "Dimension mismatch ... profile has min=640, opt=640,
+        # max=640 but tensor has 1280". Batch giảm xuống 2 vì 1280×1280×4 ~ 25MB
+        # activation per batch slot; batch=2 đủ latency + tránh OOM trên 12GB.
+        batch_size: 2
+        input:
+          object: yolov8_primary.car
+          shape: [3, 1280, 1280]
+          scale_factor: 0.0039215697906911373
+        output:
+          layer_names:
+            - output0
+          converter:
+            module: src.converters.generic_yolov8_converter
+            class_name: GenericYOLOv8Converter
+            kwargs:
+              confidence_threshold: 0.50
+              nms_iou_threshold: 0.45
+          attributes: []
+          num_detected_classes: 1
+          objects:
+            - class_id: 0
+              label: plate
+              selector:
+                module: savant.selector.detector
+                class_name: BBoxSelector
+                kwargs:
+                  confidence_threshold: 0.50
+
+    # ── Stage 2a-pre-2: Plate Detector sGIE cho truck + motorcycle ───────────
+    # Dùng cùng ONNX model, reuse TRT engine đã cache. batch_size=1 để tránh
+    # OOM trên RTX 3060 12GB khi chạy song song với sGIE car ở trên.
+    - element: nvinfer@complex_model
+      name: plate_detector_sgie_heavy
+      model:
+        format: onnx
+        model_file: /models/yolov8l_plate/yolov8l_plate.onnx
+        batch_size: 1
+        input:
+          object: yolov8_primary.truck
+          shape: [3, 1280, 1280]
+          scale_factor: 0.0039215697906911373
+        output:
+          layer_names:
+            - output0
+          converter:
+            module: src.converters.generic_yolov8_converter
+            class_name: GenericYOLOv8Converter
+            kwargs:
+              confidence_threshold: 0.35
+              nms_iou_threshold: 0.45
+          attributes: []
+          num_detected_classes: 1
+          objects:
+            - class_id: 0
+              label: plate
+              selector:
+                module: savant.selector.detector
+                class_name: BBoxSelector
+                kwargs:
+                  confidence_threshold: 0.35
+
+    - element: nvinfer@complex_model
+      name: plate_detector_sgie_moto
+      model:
+        format: onnx
+        model_file: /models/yolov8l_plate/yolov8l_plate.onnx
+        batch_size: 1
+        input:
+          object: yolov8_primary.motorcycle
+          shape: [3, 1280, 1280]
+          scale_factor: 0.0039215697906911373
+        output:
+          layer_names:
+            - output0
+          converter:
+            module: src.converters.generic_yolov8_converter
+            class_name: GenericYOLOv8Converter
+            kwargs:
+              confidence_threshold: 0.35
+              nms_iou_threshold: 0.45
+          attributes: []
+          num_detected_classes: 1
+          objects:
+            - class_id: 0
+              label: plate
+              selector:
+                module: savant.selector.detector
+                class_name: BBoxSelector
+                kwargs:
+                  confidence_threshold: 0.35
+
+    # ── Stage 2a: License Plate OCR ──────────────────────────────────────────
+    # Đọc bbox "plate" do sGIE phía trên tạo ra, chạy PP-OCRv4 rec ONNX trên
+    # crop. Nếu sGIE chưa hoạt động (engine chưa build), fallback sang ORT
+    # YOLOv8l-plate nội bộ (plate_model_path) — xem plate_ocr.py.
+    #
+    # OCR engine: PP-OCRv4 mobile rec ONNX (KHÔNG dùng paddleocr library).
+    # Input 48×320 fixed, CTC decode manual. Latency ~15-30ms/plate, giảm
+    # ~30-50ms so với PaddleOCR library.
     - element: pyfunc
       name: plate_ocr
       module: src.lpr.plate_ocr
       class_name: PlateOCR
       kwargs:
-        plate_model_path: /models/yolov8n_plate/yolov8n_plate.onnx
-        plate_conf_threshold: 0.50
-        ocr_conf_threshold: 0.60
+        plate_model_path: /models/yolov8l_plate/yolov8l_plate.onnx
+        ocr_model_path:   /models/ppocrv4_rec/ppocrv4_rec.onnx
+        plate_conf_threshold: 0.35
+        ocr_conf_threshold: 0.55
+        # Cameras chĩa thẳng vào biển số — chạy ORT trực tiếp trên full frame
+        # không cần primary detect vehicle trước.
+        # bien_xe: camera quay ngang vào dòng xe ở cự ly gần — primary YOLOv8
+        # luôn detect vehicle bbox bị clip ở mép trên (y1=0, h<200px) vì xe quá
+        # lớn so với khung. Chuyển sang direct mode để chạy plate detector
+        # thẳng trên full frame, ảnh lưu giữ nguyên context.
+        direct_plate_cams:
+          - cam_online_1
+          - bien_xe
         # ROI zones — config per-camera, updated via /api/cameras/{id}/config
         # Format: source_id → [x1, y1, x2, y2] (pixel coords của full frame)
         # Empty dict = process full frame for all cameras (default fallback).
@@ -113,10 +341,61 @@ pipeline:
         vote_window: 8
         # Background save worker
         save_crops: true
-        save_dir: /Detect/plates
+        save_dir: /Detect/lpr
+
+    # ── Stage 2b-pre: Face Detector sGIE ─────────────────────────────────────
+    # Chạy YOLOv8-face (derronqi/yolov8-face) thẳng trên GPU, operate trên crop
+    # "person" do primary tạo. Tạo object con label "face" kèm attribute
+    # "landmarks" (10 float = 5 kps × xy) dùng cho ArcFace alignment.
+    #
+    # Loại bỏ ORT CUDAExecutionProvider trong FaceRecognizer pyfunc:
+    # FaceRecognizer đọc child object "face" + landmarks attr rồi chạy align →
+    # ArcFace → anti-spoof.
+    #
+    # layer_names tương ứng 3 feature maps stride 8/16/32 — verify tên layer thực
+    # tế bằng Netron nếu TRT build fail.
+    - element: nvinfer@complex_model
+      name: face_detector_sgie
+      model:
+        format: onnx
+        model_file: /models/yolov8_face/yolov8n-face.onnx
+        batch_size: 16
+        input:
+          object: yolov8_primary.person
+          shape: [3, 640, 640]
+          scale_factor: 0.0039215697906911373
+        output:
+          # YOLOv8-face ONNX (derronqi/hpc203) có 3 feature maps nhưng tên
+          # layer thực tế: output0, 389, 397 (xác nhận qua netron).
+          # Cảnh báo "Could not find output layer 'output1'" ở các build
+          # trước là do config sai tên.
+          layer_names:
+            - output0
+            - "389"
+            - "397"
+          converter:
+            module: src.converters.yolov8_face_converter
+            class_name: YOLOv8FaceConverter
+            kwargs:
+              confidence_threshold: 0.55
+              nms_iou_threshold: 0.40
+          attributes:
+            - name: landmarks
+              internal: false
+          num_detected_classes: 1
+          objects:
+            - class_id: 0
+              label: face
+              selector:
+                module: savant.selector.detector
+                class_name: BBoxSelector
+                kwargs:
+                  confidence_threshold: 0.55
 
     # ── Stage 2b: Face Recognition (FR) ──────────────────────────────────────
-    # Kích hoạt cho các object thuộc nhóm Person
+    # Đọc child "face" + attr "landmarks" do sGIE phía trên tạo ra.
+    # Nếu sGIE thiếu (engine chưa build / output layer name sai) sẽ fallback
+    # sang YOLOv8FaceDetector ORT (yolov8_face_model_path) — xem face_recognizer.py.
     - element: pyfunc
       name: face_recognizer
       module: src.fr.face_recognizer
@@ -151,7 +430,20 @@ pipeline:
         quality_min_sharpness: 50.0
         # Save faces
         save_crops: true
-        save_dir: /Detect/faces
+        save_dir: /Detect/face
+
+    # ── Stage 2c: Behavior Analytics (Fighting + Tamper) ─────────────────────
+    # Chạy sau FR để có numpy frame; ghi tag "behavior_alerts" cho business_logic.
+    - element: pyfunc
+      name: behavior_analytics
+      module: src.analytics.behavior_pyfunc
+      class_name: BehaviorPyfunc
+      kwargs:
+        model_dir: /models
+        fighting_threshold: 0.6
+        tamper_threshold: 0.7
+        fighting_stride: 8
+        tamper_interval: 25
 
     # ── Stage 3: Business Logic ───────────────────────────────────────────────
     # ObjectLinker + BlacklistEngine + AlertManager
@@ -173,7 +465,7 @@ pipeline:
         object_linker_max_dist_px: 150
         object_linker_temporal_secs: 2.0
         # Audit logger
-        audit_base_dir: /Detect/audit
+        audit_base_dir: /Detect/behavior
         # Alert manager
         alert_rate_secs: 60
         alert_global_rpm: 20

@@ -3,10 +3,12 @@ FROM ghcr.io/insight-platform/savant-deepstream:latest
 # SV-PRO pyfunc dependencies inside Savant venv (/opt/venv).
 # Constraints:
 # - Savant 0.6.x expects numpy<2 and click~=8.1.6
-# - Pip `opencv-*` wheels shadow the image cv2 and break Savant DeepStream (e.g. cv2.cuda.ALPHA_OVER).
-#   After PaddleOCR install, uninstall pip OpenCV so the system/DeepStream cv2 is used.
-# - `src/lpr/plate_ocr.py` patches missing cv2 inpaint constants before importing paddleocr; Debian
-#   minimal cv2 builds may omit attrs that albumentations expects at import time.
+# - Pip `opencv-*` wheels shadow the image cv2 and break Savant DeepStream
+#   (e.g. cv2.cuda.ALPHA_OVER) → uninstall ở bước cuối.
+#
+# OCR engine: PP-OCRv4 mobile rec ONNX chạy trực tiếp qua ORT
+# (xem src/lpr/plate_ocr.py + /models/ppocrv4_rec/ppocrv4_rec.onnx).
+# Đã LOẠI BỎ paddleocr + paddlepaddle-gpu (~2GB image size) + albumentations.
 
 RUN /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
         && /opt/venv/bin/pip install --no-cache-dir \
@@ -16,10 +18,7 @@ RUN /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
         psycopg2-binary \
         "flask>=3.0,<4" \
         "httpx>=0.27.0" \
-        "onnxruntime-gpu>=1.17,<1.20"   # Fix: 1.24.4 không tồn tại; dùng range tương thích CUDA 12
-
-RUN /opt/venv/bin/pip install --no-cache-dir paddlepaddle-gpu==2.6.2 \
-        && /opt/venv/bin/pip install --no-cache-dir "paddleocr>=2.7,<3"
+        "onnxruntime-gpu>=1.17,<1.20"   # tương thích CUDA 12 — OCR + plate detection đều dùng provider này
 
 RUN /opt/venv/bin/pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python 2>/dev/null || true \
         && /opt/venv/bin/pip install --no-cache-dir "numpy>=1.22.4,<2" "click>=8.1.6,<8.2" "pyzmq>=24.0.0"
